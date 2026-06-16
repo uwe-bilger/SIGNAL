@@ -1,6 +1,6 @@
 secrets/
 *.json
 !frontend/package.json
-!frontend/package-lock.json
 !frontend/public/manifest.json
 .env
+frontend/package-lock.json
