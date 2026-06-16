@@ -80,6 +80,30 @@ def sku_detail(
     return run_query(sql)
 
 
+@router.get("/top-skus")
+def top_skus(
+    fiscal_year:  Optional[int] = None,
+    version_id:   Optional[str] = Query(default=None),
+    division:     Optional[str] = None,
+    channel_type: Optional[str] = None,
+    limit:        int = 15,
+):
+    where = _where_clauses(division, None, None, channel_type, None, fiscal_year, version_id)
+    sql = f"""
+        SELECT
+            f.sku_id, f.key_account_id,
+            SUM(f.total_forecast_units) AS forecast_units
+        FROM {q('fact_financial_plan')} f
+        JOIN {q('dim_sku')} s ON f.sku_id = s.sku_id
+        JOIN {q('dim_key_account')} ka ON f.key_account_id = ka.key_account_id
+        {where}
+        GROUP BY 1,2
+        ORDER BY SUM(f.total_forecast_units) DESC
+        LIMIT {limit * 10}
+    """
+    return run_query(sql)
+
+
 @router.get("/version-compare")
 def version_compare(
     version_a:    str,
