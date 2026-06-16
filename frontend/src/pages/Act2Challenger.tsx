@@ -14,7 +14,7 @@ function fmt(n: number) {
   return String(Math.round(n));
 }
 
-export function Act2_Challenger({ filters }: Props) {
+export function Act2Challenger({ filters }: Props) {
   const [reconcData, setReconcData] = useState<any>(null);
   const [exceptions, setExceptions] = useState<any[]>([]);
   const [divisionData, setDivisionData] = useState<any[]>([]);

@@ -10,7 +10,7 @@ interface Props { filters: Filters }
 const VERSION_COLORS = ["#6366F1", "#10B981", "#F59E0B", "#EF4444", "#8B5CF6", "#94A3B8"];
 const LE_VERSIONS = ["BUDGET", "OP_PLAN", "LE1", "LE2", "LE3", "LATEST_EST"];
 
-export function Act3_Reconciliation({ filters }: Props) {
+export function Act3Reconciliation({ filters }: Props) {
   const [reconcData, setReconcData] = useState<any>(null);
   const [accuracy, setAccuracy] = useState<any[]>([]);
   const [lagData, setLagData] = useState<any[]>([]);

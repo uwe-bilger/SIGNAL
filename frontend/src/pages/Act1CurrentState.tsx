@@ -42,7 +42,7 @@ function sumField(rows: any[], field: string) {
   return rows.reduce((acc, r) => acc + (Number(r[field]) || 0), 0);
 }
 
-export function Act1_CurrentState({ filters }: Props) {
+export function Act1CurrentState({ filters }: Props) {
   const [rows, setRows] = useState<any[]>([]);
   const [pyRows, setPyRows] = useState<any[]>([]);
   const [budgetRows, setBudgetRows] = useState<any[]>([]);

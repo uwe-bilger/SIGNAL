@@ -17,7 +17,7 @@ function fmtDollar(n: number) {
   return "$" + n.toFixed(2);
 }
 
-export function Act4_Acquisition({ filters }: Props) {
+export function Act4Acquisition({ filters }: Props) {
   const [data, setData] = useState<any>(null);
   const [loading, setLoading] = useState(true);
   const [selectedSku, setSelectedSku] = useState<string | null>(null);
