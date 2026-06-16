@@ -29,7 +29,7 @@ def get_exceptions(
         {where}
           AND f.version_id = 'LATEST_EST'
         GROUP BY 1,2,3,4,5,6
-        HAVING stock_risk_flag = 1 OR override_flag = 1 OR s.is_new_sku = TRUE
+        HAVING stock_risk_flag = 1 OR override_flag = 1 OR s.is_new_sku = 'True'
         ORDER BY stock_risk_flag DESC, override_flag DESC
         LIMIT 500
     """
