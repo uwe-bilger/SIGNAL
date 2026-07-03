@@ -5,7 +5,7 @@ const ACTS = [
   { path: "/", label: "Current State" },
   { path: "/challenger", label: "Challenger" },
   { path: "/reconciliation", label: "Reconciliation" },
-  { path: "/acquisition", label: "M&A" },
+  { path: "/integration", label: "FSD" },
 ];
 
 export function MobileNav() {

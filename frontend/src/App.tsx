@@ -8,7 +8,7 @@ import { Filters } from "./hooks/usePlan";
 import { Act1CurrentState } from "./pages/Act1CurrentState";
 import { Act2Challenger } from "./pages/Act2Challenger";
 import { Act3Reconciliation } from "./pages/Act3Reconciliation";
-import { Act4Acquisition } from "./pages/Act4Acquisition";
+import { Act4Integration } from "./pages/Act4Integration";
 
 const DEFAULT_FILTERS: Filters = { fiscal_year: 2024, version_id: "LATEST_EST" };
 
@@ -27,7 +27,7 @@ function App() {
               <Route path="/" element={<Act1CurrentState filters={filters} />} />
               <Route path="/challenger" element={<Act2Challenger filters={filters} />} />
               <Route path="/reconciliation" element={<Act3Reconciliation filters={filters} />} />
-              <Route path="/acquisition" element={<Act4Acquisition filters={filters} />} />
+              <Route path="/integration" element={<Act4Integration filters={filters} />} />
             </Routes>
           </main>
         </div>

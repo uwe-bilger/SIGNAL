@@ -80,7 +80,7 @@ Components:
 Filters active: all global filters apply.
 
 ## Act 2 — Challenger pack (top-down view)
-**The thing that doesn't exist yet at Relatable.**
+**Top-down vs. bottoms-up gap view.**
 
 Components:
 1. **Gap analysis** — waterfall chart: Budget → LE → Bottom-up → Gap
@@ -104,19 +104,24 @@ Components:
 5. **Bias analysis** — are we consistently over or under forecasting?
    Show mean error (not absolute) by division
 
-## Act 4 — M&A integration (Hugmoals acquisition)
-**No history. How do we plan these SKUs?**
+## Act 4 — FSD Integration
+**Acquisition boundary · ERP migration waves · Data quality transition**
+
+Two layered stories:
+1. Whole-of-FSD acquisition boundary: all data before Sept 2025 is legacy
+   Solventum/3M history. Flag with is_pre_acquisition from dim_time.
+2. Per-site ERP migration wave: SAP → Oracle JDE site-by-site. Each cutover
+   creates a visible data_quality_score step change in fact_financial_plan.
 
 Components:
-1. **Acquisition overview card** — # of new SKUs, divisions affected, go-live date
-2. **New SKU list** — table of all Hugmoals SKUs with category, initial stocking recommendation
-   Recommendation logic: median of comparable SKUs in same subcategory
-3. **Comparable SKU analysis** — for selected new SKU, show 3 most similar existing SKUs
-   with their first-12-months sales curve
-4. **Supply risk flags** — SKUs with no demand signal, supplier not yet onboarded
-   Show as red flag badges with recommended action
-5. **Transition timeline** — horizontal Gantt-style chart showing:
-   SKU onboarding → First PO → First Ship → First POS data expected
+1. **KPI cards** — Sites Live on JDE, WFA baseline %, New Post-TF SKUs, Acquisition Close date
+2. **ERP migration timeline** — per-site status (live_on_target / in_flight / legacy),
+   planned cutover date, data quality score bar. Placeholder sites labeled "illustrative".
+3. **WFA trend chart** — bar chart by year showing 54%→75% improvement with noise.
+   Caption: "Process behavior chart teaching example — routine variation around improving trend."
+4. **Acquisition boundary table** — pre vs. post Sept 2025: SKU count, units, revenue, avg DQ score
+5. **New SKU list** — post-TF product introductions (is_new_sku=True), with business line and price
+6. **Supply risk flags** — new SKUs with low forecast coverage or low DQ score
 
 ## Environment variables
 ```
@@ -129,7 +134,7 @@ For production this will be the Cloud Run URL.
 / → Act 1 (default)
 /challenger → Act 2
 /reconciliation → Act 3
-/acquisition → Act 4
+/integration → Act 4
 ```
 
 Left sidebar navigation between acts. Active act highlighted.
@@ -148,7 +153,7 @@ Left sidebar navigation between acts. Active act highlighted.
 - [ ] Act 2 waterfall chart renders gap analysis
 - [ ] Act 3 version comparison waterfall renders all 6 versions
 - [ ] Act 3 lag accuracy chart shows MAPE for LAG1-LAG10
-- [ ] Act 4 new SKU list shows all 20 Hugmoals SKUs
+- [ ] Act 4 shows FSD Integration: site migration status, WFA trend, new post-TF SKUs
 - [ ] Filters update charts when changed
 - [ ] App renders correctly on mobile viewport (375px)
 - [ ] No hardcoded data — everything comes from API

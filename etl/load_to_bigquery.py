@@ -174,6 +174,7 @@ def validate():
         UNION ALL SELECT 'fact_financial_plan', COUNT(*) FROM `{ds}.fact_financial_plan`
         UNION ALL SELECT 'fact_pos_weekly', COUNT(*) FROM `{ds}.fact_pos_weekly`
         UNION ALL SELECT 'fact_forecast_snapshot', COUNT(*) FROM `{ds}.fact_forecast_snapshot`
+        UNION ALL SELECT 'dim_site',             COUNT(*) FROM `{ds}.dim_site`
     """.replace("{ds}", dataset_ref)
     print("\nValidation counts:")
     for row in client.query(sql).result():
@@ -204,6 +205,7 @@ def main():
     load_dim("dim_time",             "dim_time.csv")
     load_dim("dim_version",          "dim_version.csv")
     load_dim("dim_promotion",        "dim_promotion.csv")
+    load_dim("dim_site",             "dim_site.csv")
 
     # Facts (mixed types — GCS URI + autodetect works correctly)
     print("\n[FACTS]")

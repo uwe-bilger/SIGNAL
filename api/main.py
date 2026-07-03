@@ -8,7 +8,7 @@ key_path = Path(__file__).parent.parent / "secrets" / "signal-key.json"
 if key_path.exists():
     os.environ.setdefault("GOOGLE_APPLICATION_CREDENTIALS", str(key_path))
 
-from routers import dimensions, plan, pos, forecast, exceptions, acquisition, reconciliation
+from routers import dimensions, plan, pos, forecast, exceptions, integration, reconciliation
 
 app = FastAPI(title="SIGNAL API", version="1.0.0")
 
@@ -24,7 +24,7 @@ app.include_router(plan.router)
 app.include_router(pos.router)
 app.include_router(forecast.router)
 app.include_router(exceptions.router)
-app.include_router(acquisition.router)
+app.include_router(integration.router)
 app.include_router(reconciliation.router)
 
 
