@@ -5,7 +5,7 @@ const ACTS = [
   { path: "/", label: "Act 1", sublabel: "Current State", icon: "📊" },
   { path: "/challenger", label: "Act 2", sublabel: "Challenger Pack", icon: "⚡" },
   { path: "/reconciliation", label: "Act 3", sublabel: "Reconciliation", icon: "🔄" },
-  { path: "/acquisition", label: "Act 4", sublabel: "M&A Integration", icon: "🚀" },
+  { path: "/integration", label: "Act 4", sublabel: "FSD Integration", icon: "🚀" },
 ];
 
 export function Sidebar() {

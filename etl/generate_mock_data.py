@@ -1,10 +1,10 @@
 """
-SIGNAL mock data generator — v4 (based on verified Relatable interview facts)
-Generates all dimension and fact CSVs, uploads to gs://signal-raw-data/raw/
+SIGNAL mock data generator — v5 (FSD pivot)
+Generates all dimension and fact CSVs for Thermo Fisher's Filtration & Separation Division.
+Uploads to gs://signal-raw-data/raw/
 """
 
 import csv
-import math
 import os
 import random
 import uuid
@@ -56,9 +56,10 @@ def write_csv(path: Path, rows: list, fieldnames: list = None):
 
 # ---------------------------------------------------------------------------
 # Fiscal calendar helpers (4-4-5, year starts first Monday of February)
+# Unchanged from v4 — architecture is sound.
 # ---------------------------------------------------------------------------
 
-WEEKS_PER_MONTH = [4, 4, 5, 4, 4, 5, 4, 4, 5, 4, 4, 5]  # 12 fiscal months
+WEEKS_PER_MONTH = [4, 4, 5, 4, 4, 5, 4, 4, 5, 4, 4, 5]
 
 
 def fiscal_year_start(year: int) -> date:
@@ -68,7 +69,6 @@ def fiscal_year_start(year: int) -> date:
 
 
 def build_fiscal_week_map(year_range=range(2019, 2028)):
-    """Returns dict: date -> (fiscal_year, fiscal_quarter, fiscal_month, fiscal_week)"""
     result = {}
     for yr in year_range:
         start = fiscal_year_start(yr)
@@ -78,11 +78,10 @@ def build_fiscal_week_map(year_range=range(2019, 2028)):
                 week_num += 1
                 fq = m_idx // 3 + 1
                 fm = m_idx + 1
-                fw = week_num
                 for d in range(7):
                     day = start + timedelta(weeks=(week_num - 1), days=d)
                     if day not in result:
-                        result[day] = (yr, fq, fm, fw)
+                        result[day] = (yr, fq, fm, week_num)
     return result
 
 
@@ -95,13 +94,17 @@ def date_to_fiscal(d: date):
     return (d.year, (d.month - 1) // 3 + 1, d.month, 1)
 
 
+# Thermo Fisher acquired Solventum P&F (becoming FSD) in Sept 2025.
+# All data before this date is "pre-acquisition" (legacy Solventum/3M history).
+ACQUISITION_DATE = date(2025, 9, 1)
+
+
 # ---------------------------------------------------------------------------
-# dim_time
+# dim_time  (adds is_pre_acquisition flag)
 # ---------------------------------------------------------------------------
 
 def gen_dim_time():
     print("Generating dim_time...")
-    # Build per-fiscal-week bounds: (fy, fq, fm, fw) -> (start_date, end_date)
     fw_bounds = {}
     for yr in range(2019, 2028):
         start = fiscal_year_start(yr)
@@ -117,8 +120,8 @@ def gen_dim_time():
     rows = []
     d = date(2019, 1, 1)
     end = date(2026, 12, 31)
-    month_names = ["January","February","March","April","May","June",
-                   "July","August","September","October","November","December"]
+    month_names = ["January", "February", "March", "April", "May", "June",
+                   "July", "August", "September", "October", "November", "December"]
 
     while d <= end:
         fy, fq, fm, fw = date_to_fiscal(d)
@@ -140,17 +143,13 @@ def gen_dim_time():
             prior_month_days = 0
             proration = 1.0
 
-        pattern = str(WEEKS_PER_MONTH[(fm - 1)])
-
-        iso_week = d.isocalendar()[1]
-
         rows.append({
             "date_id": d.isoformat(),
             "calendar_year": d.year,
             "calendar_quarter": (d.month - 1) // 3 + 1,
             "calendar_month": d.month,
             "calendar_month_name": month_names[d.month - 1],
-            "calendar_week_of_year": iso_week,
+            "calendar_week_of_year": d.isocalendar()[1],
             "day_of_week": d.isoweekday(),
             "is_weekend": d.isoweekday() >= 6,
             "fiscal_year": fy,
@@ -158,11 +157,15 @@ def gen_dim_time():
             "fiscal_month": fm,
             "fiscal_week": fw,
             "fiscal_period_name": f"FY{fy}-Q{fq}-P{fm:02d}-W{fw:02d}",
-            "fiscal_445_pattern": pattern,
+            "fiscal_445_pattern": str(WEEKS_PER_MONTH[(fm - 1)]),
             "is_partial_week": is_partial,
             "partial_week_prior_month_days": prior_month_days,
             "partial_week_current_month_days": curr_month_days,
             "partial_week_proration_factor": proration,
+            # True for all dates before TF acquisition close (Sept 2025).
+            # Pre-acquisition data reflects legacy Solventum/3M planning processes —
+            # lower data quality, no formal SIOP, WFA baseline of 54%.
+            "is_pre_acquisition": d < ACQUISITION_DATE,
         })
         d += timedelta(days=1)
 
@@ -173,187 +176,258 @@ def gen_dim_time():
 
 
 # ---------------------------------------------------------------------------
-# Dimension tables
+# FSD business hierarchy dimensions
+#
+# Column names preserved from v4 schema (division_id / brand_id /
+# product_line_id / sub_product_line_id) — the data model shape is unchanged;
+# the content pivots from Relatable CPG to FSD filtration.
+#
+# Mapping:
+#   division_id         → Business Line  (3 BLs)
+#   brand_id            → Product Family (depth, sterile, chroma, viral, ...)
+#   product_line_id     → Platform/Series
+#   sub_product_line_id → Fine classification
 # ---------------------------------------------------------------------------
 
 DIVISIONS = [
-    ("DIV-01", "Games & Play"),
-    ("DIV-02", "Lifestyle & Comfort"),
-    ("DIV-03", "Hugimals World"),
+    # (division_id, division_name)
+    ("DIV-01", "Bioprocessing Filtration"),
+    ("DIV-02", "Healthcare & Industrial Filtration"),
+    # Demand driver is structurally different for Membranes: tracks the OEM customer's
+    # production schedule, not end-patient/procedure volume. See gen_fact_financial_plan.
+    ("DIV-03", "Membranes (incl. OEM)"),
 ]
 
 BRANDS = [
-    ("BRD-01", "What Do You Meme?", "DIV-01"),
-    ("BRD-02", "Buzzed", "DIV-01"),
-    ("BRD-03", "Relatable Originals", "DIV-01"),
-    ("BRD-04", "Bee Street Games", "DIV-01"),
-    ("BRD-05", "Hunt A Killer", "DIV-01"),
-    ("BRD-06", "Lifestyle & Comfort", "DIV-02"),
-    ("BRD-07", "Hugimals World", "DIV-03"),
+    # (brand_id, product_family_name, division_id)
+    ("BRD-01", "Depth Filtration",             "DIV-01"),
+    ("BRD-02", "Membrane Sterile Filtration",   "DIV-01"),
+    ("BRD-03", "Chromatographic Clarification", "DIV-01"),
+    ("BRD-04", "Viral Clearance",               "DIV-01"),
+    ("BRD-05", "Medical Device Filtration",     "DIV-02"),
+    ("BRD-06", "Industrial Process Filtration", "DIV-02"),
+    ("BRD-07", "OEM Membrane Media",            "DIV-03"),
+    ("BRD-08", "Specialty Membranes",           "DIV-03"),
 ]
 
 PRODUCT_LINES = [
-    ("PL-01", "WDYM Core & Family", "BRD-01"),
-    ("PL-02", "WDYM Expansion Packs", "BRD-01"),
-    ("PL-03", "WDYM Licensed & Collab", "BRD-01"),
-    ("PL-04", "WDYM Party & Social", "BRD-01"),
-    ("PL-05", "Buzzed Core & Expansions", "BRD-02"),
-    ("PL-06", "Buzzed Accessories", "BRD-02"),
-    ("PL-07", "Relatable Party Games", "BRD-03"),
-    ("PL-08", "Relatable Family & Kids", "BRD-03"),
-    ("PL-09", "Relatable Outdoor & Novelty", "BRD-03"),
-    ("PL-10", "Relatable Wellness", "BRD-03"),
-    ("PL-11", "Bee Street Games", "BRD-04"),
-    ("PL-12", "Hunt A Killer", "BRD-05"),
-    ("PL-13", "Emotional Support Pals", "BRD-06"),
-    ("PL-14", "Cozy Concepts", "BRD-06"),
-    ("PL-15", "Hugimals Classic", "BRD-07"),
-    ("PL-16", "Hugarounds", "BRD-07"),
-    ("PL-17", "Hugimals Mini & Accessories", "BRD-07"),
+    # (product_line_id, platform_series_name, brand_id)
+    ("PL-01", "Clariflex™ Lenticular Series",       "BRD-01"),
+    ("PL-02", "SingleClear™ Capsule Depth Filters", "BRD-01"),
+    ("PL-03", "SterilPure™ PES Series",             "BRD-02"),
+    ("PL-04", "SterilPure™ PVDF Series",            "BRD-02"),
+    ("PL-05", "FlexFlow™ Sterilizing Capsules",     "BRD-02"),
+    ("PL-06", "AEX-Pro™ Anion Exchange",            "BRD-03"),
+    ("PL-07", "MixMode™ Multimodal Chromatography", "BRD-03"),
+    ("PL-08", "ViralGuard™ Parvo-Retrovirus",       "BRD-04"),
+    ("PL-09", "ParvoSure™ 20nm Filters",            "BRD-04"),
+    ("PL-10", "MedLine™ Syringe Filters",           "BRD-05"),
+    ("PL-11", "AirShield™ Venting Filters",         "BRD-05"),
+    ("PL-12", "SafeFlow™ IV Line Filters",          "BRD-05"),
+    ("PL-13", "InduPure™ Liquid Process Filters",   "BRD-06"),
+    ("PL-14", "GasGuard™ Gas Filtration",           "BRD-06"),
+    ("PL-15", "BattSep™ Battery Separator",         "BRD-07"),
+    ("PL-16", "UPW-Mem™ Ultra-Pure Water",          "BRD-07"),
+    ("PL-17", "MedOEM™ Medical OEM Membranes",      "BRD-07"),
+    ("PL-18", "NanoFilt™ Specialty Filtration",     "BRD-08"),
 ]
 
 SUB_PRODUCT_LINES = [
-    ("SPL-01", "WDYM Core Games", "PL-01"),
-    ("SPL-02", "WDYM Family Games", "PL-01"),
-    ("SPL-03", "WDYM NSFW & Adult Expansions", "PL-02"),
-    ("SPL-04", "WDYM Pop Culture Expansions", "PL-02"),
-    ("SPL-05", "WDYM Licensed Brand Collabs", "PL-03"),
-    ("SPL-06", "WDYM Creator Series", "PL-03"),
-    ("SPL-07", "WDYM Social & Drinking", "PL-04"),
-    ("SPL-08", "Buzzed Core", "PL-05"),
-    ("SPL-09", "Buzzed Expansions", "PL-05"),
-    ("SPL-10", "Buzzed Accessories", "PL-06"),
-    ("SPL-11", "Relatable Adult Party", "PL-07"),
-    ("SPL-12", "Relatable Relationship Games", "PL-07"),
-    ("SPL-13", "Relatable Family Games", "PL-08"),
-    ("SPL-14", "Relatable Kids Toys", "PL-08"),
-    ("SPL-15", "Pool & Outdoor", "PL-09"),
-    ("SPL-16", "Novelty Gifts", "PL-09"),
-    ("SPL-17", "Wellness & Self-Care", "PL-10"),
-    ("SPL-18", "Blind Box & Collectibles", "PL-10"),
-    ("SPL-19", "Bee Street Core Games", "PL-11"),
-    ("SPL-20", "Hunt A Killer Series", "PL-12"),
-    ("SPL-21", "ESP Characters", "PL-13"),
-    ("SPL-22", "ESP Accessories", "PL-13"),
-    ("SPL-23", "Cozy Blankets", "PL-14"),
-    ("SPL-24", "Hugimals Classic Characters", "PL-15"),
-    ("SPL-25", "Hugaround Characters", "PL-16"),
-    ("SPL-26", "Hug Babies & Bundles", "PL-17"),
-    ("SPL-27", "Hugimals Accessories", "PL-17"),
+    ("SPL-01", "Lenticular Depth Sheets",         "PL-01"),
+    ("SPL-02", "Lenticular Depth Pods",           "PL-01"),
+    ("SPL-03", "Depth Filter Capsules Small",     "PL-02"),
+    ("SPL-04", "Depth Filter Capsules Large",     "PL-02"),
+    ("SPL-05", "0.2µm PES Sterilizing Filters",  "PL-03"),
+    ("SPL-06", "0.45µm PES Clarifying Filters",  "PL-03"),
+    ("SPL-07", "0.2µm PVDF Sterilizing",         "PL-04"),
+    ("SPL-08", "0.45µm PVDF Clarifying",         "PL-04"),
+    ("SPL-09", "Capsule Sterilizing Inline",      "PL-05"),
+    ("SPL-10", "Capsule Sterilizing End-Use",     "PL-05"),
+    ("SPL-11", "Strong AEX Resins",              "PL-06"),
+    ("SPL-12", "Weak AEX Resins",               "PL-06"),
+    ("SPL-13", "Mixed Mode Cation",              "PL-07"),
+    ("SPL-14", "Mixed Mode Anion",               "PL-07"),
+    ("SPL-15", "Parvo-Retrovirus Capsules",      "PL-08"),
+    ("SPL-16", "Parvo-Retrovirus Cassettes",     "PL-08"),
+    ("SPL-17", "20nm Parvo Filters",             "PL-09"),
+    ("SPL-18", "Syringe Filters Sterile",        "PL-10"),
+    ("SPL-19", "Syringe Filters Aqueous",        "PL-10"),
+    ("SPL-20", "Hydrophobic Vent Filters",       "PL-11"),
+    ("SPL-21", "Hydrophilic Vent Filters",       "PL-11"),
+    ("SPL-22", "IV Line Filters 0.2µm",         "PL-12"),
+    ("SPL-23", "IV Line Filters 1.2µm",         "PL-12"),
+    ("SPL-24", "Bag Filters Industrial",         "PL-13"),
+    ("SPL-25", "Cartridge Filters Industrial",   "PL-13"),
+    ("SPL-26", "Process Gas Filters",            "PL-14"),
+    ("SPL-27", "Compressed Air Filters",         "PL-14"),
+    ("SPL-28", "Li-Ion Battery Separators",      "PL-15"),
+    ("SPL-29", "Solid State Battery Separators", "PL-15"),
+    ("SPL-30", "UPW Filtration Membranes",       "PL-16"),
+    ("SPL-31", "Ultrapure Water Polishing",      "PL-16"),
+    ("SPL-32", "Medical OEM Flat Sheet",         "PL-17"),
+    ("SPL-33", "Medical OEM Hollow Fiber",       "PL-17"),
+    ("SPL-34", "NanoFilt High-Performance",      "PL-18"),
+    ("SPL-35", "NanoFilt Research Grade",        "PL-18"),
 ]
 
+# ---------------------------------------------------------------------------
+# Product category hierarchy (maps SKUs to filtration technology segments)
+# ---------------------------------------------------------------------------
+
 MAJOR_CATEGORIES = [
-    ("MCAT-01", "Games & Entertainment"),
-    ("MCAT-02", "Lifestyle & Home"),
-    ("MCAT-03", "Wellness & Comfort"),
+    ("MCAT-01", "Filtration Media"),
+    ("MCAT-02", "Systems & Devices"),
+    ("MCAT-03", "Membrane Products"),
 ]
 
 CATEGORIES = [
-    ("CAT-01", "Adult Party Games", "MCAT-01"),
-    ("CAT-02", "Family & Kids Games", "MCAT-01"),
-    ("CAT-03", "Mystery & Strategy Games", "MCAT-01"),
-    ("CAT-04", "Outdoor & Novelty", "MCAT-02"),
-    ("CAT-05", "Home Comfort", "MCAT-02"),
-    ("CAT-06", "Licensed & Collectible", "MCAT-02"),
-    ("CAT-07", "Emotional Wellness", "MCAT-03"),
-    ("CAT-08", "Therapeutic Plush", "MCAT-03"),
-    ("CAT-09", "Self-Care & Accessories", "MCAT-03"),
+    ("CAT-01", "Depth Filtration",              "MCAT-01"),
+    ("CAT-02", "Sterile Filtration",            "MCAT-01"),
+    ("CAT-03", "Viral Clearance",               "MCAT-01"),
+    ("CAT-04", "Chromatography",                "MCAT-02"),
+    ("CAT-05", "Medical Device Filtration",     "MCAT-02"),
+    ("CAT-06", "Industrial Filtration",         "MCAT-02"),
+    ("CAT-07", "Battery Separator Membranes",   "MCAT-03"),
+    ("CAT-08", "UPW & Semiconductor Membranes", "MCAT-03"),
+    ("CAT-09", "Medical OEM Membranes",         "MCAT-03"),
 ]
 
 SUBCATEGORIES = [
-    ("SCAT-01", "Meme & Card Games", "CAT-01"),
-    ("SCAT-02", "Drinking & Social Games", "CAT-01"),
-    ("SCAT-03", "Family Card Games", "CAT-02"),
-    ("SCAT-04", "Kids Toys", "CAT-02"),
-    ("SCAT-05", "Mystery Box Games", "CAT-03"),
-    ("SCAT-06", "Subscription Games", "CAT-03"),
-    ("SCAT-07", "Pool & Outdoor", "CAT-04"),
-    ("SCAT-08", "Novelty Gifts", "CAT-04"),
-    ("SCAT-09", "Blankets & Throws", "CAT-05"),
-    ("SCAT-10", "Lifestyle Accessories", "CAT-05"),
-    ("SCAT-11", "Brand Collabs", "CAT-06"),
-    ("SCAT-12", "Creator Series", "CAT-06"),
-    ("SCAT-13", "Support Characters", "CAT-07"),
-    ("SCAT-14", "Plush Accessories", "CAT-07"),
-    ("SCAT-15", "Weighted Plush", "CAT-08"),
-    ("SCAT-16", "Warmable Plush", "CAT-08"),
-    ("SCAT-17", "Self-Care Kits", "CAT-09"),
-    ("SCAT-18", "Wellness Accessories", "CAT-09"),
+    ("SCAT-01", "Lenticular Depth Filters",         "CAT-01"),
+    ("SCAT-02", "Single-Use Depth Filter Capsules", "CAT-01"),
+    ("SCAT-03", "PES Membrane Filters",             "CAT-02"),
+    ("SCAT-04", "PVDF Membrane Filters",            "CAT-02"),
+    ("SCAT-05", "Capsule Filters Sterilizing Grade","CAT-02"),
+    ("SCAT-06", "Parvo-Retrovirus Filters",         "CAT-03"),
+    ("SCAT-07", "20nm Virus Filters",               "CAT-03"),
+    ("SCAT-08", "AEX Resins",                       "CAT-04"),
+    ("SCAT-09", "Multimodal Resins",                "CAT-04"),
+    ("SCAT-10", "Syringe Filters Medical",          "CAT-05"),
+    ("SCAT-11", "Venting & Exhaust Filters",        "CAT-05"),
+    ("SCAT-12", "IV Line Filters",                  "CAT-05"),
+    ("SCAT-13", "Liquid Process Filters",           "CAT-06"),
+    ("SCAT-14", "Gas Filtration",                   "CAT-06"),
+    ("SCAT-15", "Li-Ion Battery Separators",        "CAT-07"),
+    ("SCAT-16", "Solid State Battery Separators",   "CAT-07"),
+    ("SCAT-17", "UPW Semiconductor Membranes",      "CAT-08"),
+    ("SCAT-18", "Medical OEM Flat Sheet Membranes", "CAT-09"),
 ]
 
+# ---------------------------------------------------------------------------
+# Channel / geography hierarchy
+#
+# PLACEHOLDER TAXONOMY — inferred from public Thermo Fisher/FSD materials,
+# not yet validated against FSD's actual CRM or channel structure.
+# Revisit once system access is available.
+# ---------------------------------------------------------------------------
+
 CHANNEL_TYPES = [
-    ("CHN-01", "Retail"),
-    ("CHN-02", "E-commerce"),
-    ("CHN-03", "DTC"),
-    ("CHN-04", "TikTok Shop"),
-    ("CHN-05", "Distributor"),
+    ("CHN-01", "Direct Sales"),
+    ("CHN-02", "Distributor"),
+    ("CHN-03", "OEM Contract"),
+    ("CHN-04", "CDMO Key Account"),
 ]
 
 MARKETS = [
-    ("MKT-01", "Northeast Retail", "CHN-01"),
-    ("MKT-02", "Southeast Retail", "CHN-01"),
-    ("MKT-03", "Midwest Retail", "CHN-01"),
-    ("MKT-04", "West Retail", "CHN-01"),
-    ("MKT-05", "Southwest Retail", "CHN-01"),
-    ("MKT-06", "Amazon US", "CHN-02"),
-    ("MKT-07", "Walmart.com", "CHN-02"),
-    ("MKT-08", "Target.com", "CHN-02"),
-    ("MKT-09", "Relatable.com Direct", "CHN-03"),
-    ("MKT-10", "Subscribe & Save DTC", "CHN-03"),
-    ("MKT-11", "TikTok Shop US", "CHN-04"),
-    ("MKT-12", "UNFI Distribution", "CHN-05"),
-    ("MKT-13", "KeHE Distribution", "CHN-05"),
+    # (market_id, end_market_name, channel_type_id)
+    ("MKT-01", "Large Pharma Direct",    "CHN-01"),
+    ("MKT-02", "Biotech Direct",         "CHN-01"),
+    ("MKT-03", "Global Distribution",    "CHN-02"),
+    ("MKT-04", "Regional Distribution",  "CHN-02"),
+    ("MKT-05", "Battery & EV OEM",       "CHN-03"),
+    ("MKT-06", "Semiconductor OEM",      "CHN-03"),
+    ("MKT-07", "Large CDMO",             "CHN-04"),
+    ("MKT-08", "Specialty CDMO",         "CHN-04"),
 ]
 
 CUSTOMER_GROUPS = [
-    ("CG-01", "Mass Retail Northeast", "MKT-01"),
-    ("CG-02", "Drug & Specialty Northeast", "MKT-01"),
-    ("CG-03", "Mass Retail Southeast", "MKT-02"),
-    ("CG-04", "Mass Retail Midwest", "MKT-03"),
-    ("CG-05", "Mass Retail West", "MKT-04"),
-    ("CG-06", "Specialty West", "MKT-04"),
-    ("CG-07", "Mass Retail Southwest", "MKT-05"),
-    ("CG-08", "Amazon Vendor Central", "MKT-06"),
-    ("CG-09", "Amazon 3P Sellers", "MKT-06"),
-    ("CG-10", "Walmart.com Digital", "MKT-07"),
-    ("CG-11", "Target.com Digital", "MKT-08"),
-    ("CG-12", "Relatable DTC Customers", "MKT-09"),
-    ("CG-13", "Subscription Customers", "MKT-10"),
-    ("CG-14", "TikTok Shop Buyers", "MKT-11"),
-    ("CG-15", "UNFI Retail Partners", "MKT-12"),
-    ("CG-16", "KeHE Retail Partners", "MKT-13"),
+    ("CG-01", "Global Top Pharma",    "MKT-01"),
+    ("CG-02", "Mid-size Pharma",      "MKT-01"),
+    ("CG-03", "Large Biotech",        "MKT-02"),
+    ("CG-04", "Emerging Biotech",     "MKT-02"),
+    ("CG-05", "Global Distribution",  "MKT-03"),
+    ("CG-06", "Regional Distribution","MKT-04"),
+    ("CG-07", "Battery OEM",          "MKT-05"),
+    ("CG-08", "Semiconductor OEM",    "MKT-06"),
+    ("CG-09", "Top-Tier CDMO",        "MKT-07"),
+    ("CG-10", "Specialty CDMO",       "MKT-08"),
 ]
 
 KEY_ACCOUNTS = [
-    ("KA-01", "Walmart", "CG-01", "CHN-01"),
-    ("KA-02", "Target", "CG-03", "CHN-01"),
-    ("KA-03", "CVS", "CG-02", "CHN-01"),
-    ("KA-04", "Walgreens", "CG-02", "CHN-01"),
-    ("KA-05", "Kroger", "CG-04", "CHN-01"),
-    ("KA-06", "Five Below", "CG-01", "CHN-01"),
-    ("KA-07", "GameStop", "CG-05", "CHN-01"),
-    ("KA-08", "Barnes & Noble", "CG-05", "CHN-01"),
-    ("KA-09", "Urban Outfitters", "CG-06", "CHN-01"),
-    ("KA-10", "TJ Maxx", "CG-04", "CHN-01"),
-    ("KA-11", "Albertsons", "CG-07", "CHN-01"),
-    ("KA-12", "HEB", "CG-07", "CHN-01"),
-    ("KA-13", "Amazon 1P", "CG-08", "CHN-02"),
-    ("KA-14", "Amazon 3P", "CG-09", "CHN-02"),
-    ("KA-15", "Walmart.com", "CG-10", "CHN-02"),
-    ("KA-16", "Target.com", "CG-11", "CHN-02"),
-    ("KA-17", "Relatable.com", "CG-12", "CHN-03"),
-    ("KA-18", "Subscribe & Save", "CG-13", "CHN-03"),
-    ("KA-19", "TikTok Shop US", "CG-14", "CHN-04"),
-    ("KA-20", "UNFI East", "CG-15", "CHN-05"),
-    ("KA-21", "UNFI West", "CG-15", "CHN-05"),
-    ("KA-22", "KeHE", "CG-16", "CHN-05"),
+    # (ka_id, account_name, customer_group_id, channel_type_id)
+    # Direct pharma — largest buyers of bioprocessing filtration
+    ("KA-01", "Pfizer",             "CG-01", "CHN-01"),
+    ("KA-02", "Merck & Co",         "CG-01", "CHN-01"),
+    ("KA-03", "AstraZeneca",        "CG-01", "CHN-01"),
+    ("KA-04", "Roche",              "CG-01", "CHN-01"),
+    ("KA-05", "Novo Nordisk",       "CG-01", "CHN-01"),
+    ("KA-06", "Lilly",              "CG-02", "CHN-01"),
+    ("KA-07", "Sanofi",             "CG-02", "CHN-01"),
+    ("KA-08", "BMS",                "CG-01", "CHN-01"),
+    ("KA-09", "Biogen",             "CG-03", "CHN-01"),
+    ("KA-10", "Moderna",            "CG-03", "CHN-01"),
+    ("KA-11", "Amgen",              "CG-03", "CHN-01"),
+    ("KA-12", "J&J Biologics",      "CG-02", "CHN-01"),
+    # Distributors
+    ("KA-13", "VWR / Avantor",           "CG-05", "CHN-02"),
+    ("KA-14", "Fisher Scientific",       "CG-05", "CHN-02"),
+    ("KA-15", "Sigma-Aldrich / MKG",     "CG-05", "CHN-02"),
+    # OEM — battery & semiconductor
+    ("KA-16", "CATL",            "CG-07", "CHN-03"),
+    ("KA-17", "Samsung SDI",     "CG-07", "CHN-03"),
+    ("KA-18", "TSMC / UPW",     "CG-08", "CHN-03"),
+    # CDMOs
+    ("KA-19", "Lonza",              "CG-09", "CHN-04"),
+    ("KA-20", "Catalent",           "CG-09", "CHN-04"),
+    ("KA-21", "Samsung Biologics",  "CG-09", "CHN-04"),
+    ("KA-22", "WuXi AppTec",        "CG-10", "CHN-04"),
 ]
 
 KA_CHANNEL = {ka[0]: ka[3] for ka in KEY_ACCOUNTS}
 
+# ---------------------------------------------------------------------------
+# Site / Plant dimension  (net new — did not exist in v4)
+#
+# Three sites are real and confirmed from public FSD/Thermo Fisher materials:
+# Charlotte NC, Maplewood MN, Frederick MD. European sites are plausible
+# placeholders — is_placeholder_site=True means never present as fact in UI,
+# only as "illustrative" in tooltips/legends.
+#
+# ERP migration: legacy SAP (inherited from 3M/Solventum) → Oracle JD Edwards.
+# Migration waves are site-by-site; cutover dates create a visible data-quality
+# step change — a real, dateable level-shift event useful for teaching the
+# difference between legitimate signal and data artifact.
+# ---------------------------------------------------------------------------
+
+SITES = [
+    # (site_id, site_name, city, state_or_region, country,
+    #  business_lines_served, legacy_erp, target_erp,
+    #  migration_wave, planned_cutover_date, migration_status, is_placeholder_site)
+    ("SITE-01", "Charlotte Manufacturing Hub", "Charlotte",   "NC",      "US",
+     "DIV-01|DIV-02", "SAP", "Oracle JDE/E1", 1, "2025-07-01", "live_on_target", False),
+    ("SITE-02", "Maplewood Technology Center", "Maplewood",   "MN",      "US",
+     "DIV-01|DIV-03", "SAP", "Oracle JDE/E1", 2, "2025-10-01", "in_flight",      False),
+    ("SITE-03", "Frederick Operations",        "Frederick",   "MD",      "US",
+     "DIV-02",        "SAP", "Oracle JDE/E1", 2, "2026-01-01", "legacy",          False),
+    ("SITE-04", "Düsseldorf EMEA Hub",         "Düsseldorf",  "NRW",     "DE",
+     "DIV-01|DIV-02", "SAP", "Oracle JDE/E1", 3, "2026-04-01", "legacy",          True),
+    ("SITE-05", "Limerick Membrane Plant",     "Limerick",    "Munster", "IE",
+     "DIV-03",        "SAP", "Oracle JDE/E1", 3, "2026-07-01", "legacy",          True),
+]
+
+# Map site → primary divisions and cutover date (for data quality scoring)
+SITE_CUTOVER = {s[0]: date.fromisoformat(s[9]) for s in SITES}
+SITE_STATUS   = {s[0]: s[10] for s in SITES}
+
+# Primary site per division (simplified — one primary site, cross-ships possible)
+DIV_PRIMARY_SITE = {
+    "DIV-01": "SITE-01",
+    "DIV-02": "SITE-03",
+    "DIV-03": "SITE-02",
+}
 
 # ---------------------------------------------------------------------------
-# SKU data
+# SKU definitions
 # ---------------------------------------------------------------------------
 
 def build_skus():
@@ -378,247 +452,243 @@ def build_skus():
             "is_new_sku": is_new,
         })
 
-    # WDYM Core & Family
-    sku("WDYM-CORE-001","What Do You Meme? Core Game","DIV-01","BRD-01","PL-01","SPL-01","MCAT-01","CAT-01","SCAT-01",24.99,9.50,"2019-01-01")
-    sku("WDYM-CORE-002","What Do You Meme? GIF Edition","DIV-01","BRD-01","PL-01","SPL-01","MCAT-01","CAT-01","SCAT-01",24.99,9.50,"2019-06-01")
-    sku("WDYM-CORE-003","What Do You Meme? Family Edition","DIV-01","BRD-01","PL-01","SPL-02","MCAT-01","CAT-02","SCAT-03",19.99,7.50,"2020-01-01")
-    sku("WDYM-FMLY-001","New Phone Who Dis?","DIV-01","BRD-01","PL-01","SPL-02","MCAT-01","CAT-02","SCAT-03",21.99,8.50,"2019-06-01")
-    sku("WDYM-FMLY-002","New Phone Who Dis? Family Edition","DIV-01","BRD-01","PL-01","SPL-02","MCAT-01","CAT-02","SCAT-03",19.99,7.50,"2020-06-01")
-    sku("WDYM-FMLY-003","Guess The Gibberish Family Game","DIV-01","BRD-01","PL-01","SPL-02","MCAT-01","CAT-02","SCAT-03",19.99,7.50,"2021-03-01")
-    sku("WDYM-CRSR-001","What Do You Meme? Career Series: Teachers","DIV-01","BRD-01","PL-01","SPL-01","MCAT-01","CAT-01","SCAT-01",24.99,9.50,"2022-07-01")
-    sku("WDYM-CRSR-002","What Do You Meme? Career Series: Nurses","DIV-01","BRD-01","PL-01","SPL-01","MCAT-01","CAT-01","SCAT-01",24.99,9.50,"2022-09-01")
+    # ------------------------------------------------------------------
+    # DIV-01 Bioprocessing Filtration
+    # ------------------------------------------------------------------
 
-    # WDYM Expansions
-    sku("WDYM-XPAK-001","WDYM NSFW Expansion Pack","DIV-01","BRD-01","PL-02","SPL-03","MCAT-01","CAT-01","SCAT-01",9.99,3.50,"2019-01-01")
-    sku("WDYM-XPAK-002","WDYM Fresh Memes #1 Expansion","DIV-01","BRD-01","PL-02","SPL-04","MCAT-01","CAT-01","SCAT-01",11.99,4.25,"2020-03-01")
-    sku("WDYM-XPAK-003","WDYM Fresh Memes #2 Expansion","DIV-01","BRD-01","PL-02","SPL-04","MCAT-01","CAT-01","SCAT-01",11.99,4.25,"2021-03-01")
-    sku("WDYM-XPAK-004","WDYM After Hours Expansion","DIV-01","BRD-01","PL-02","SPL-03","MCAT-01","CAT-01","SCAT-01",14.99,5.50,"2020-06-01")
-    sku("WDYM-XPAK-005","WDYM Trisha Paytas Expansion","DIV-01","BRD-01","PL-02","SPL-04","MCAT-01","CAT-01","SCAT-01",9.99,3.50,"2021-09-01")
-    sku("WDYM-XPAK-006","New Phone Who Dis? Expansion","DIV-01","BRD-01","PL-02","SPL-04","MCAT-01","CAT-01","SCAT-01",12.99,4.75,"2020-01-01")
-    sku("WDYM-XPAK-007","WDYM Pop Culture Pack Vol 1","DIV-01","BRD-01","PL-02","SPL-04","MCAT-01","CAT-01","SCAT-01",11.99,4.25,"2021-06-01")
-    sku("WDYM-XPAK-008","WDYM Pop Culture Pack Vol 2","DIV-01","BRD-01","PL-02","SPL-04","MCAT-01","CAT-01","SCAT-01",11.99,4.25,"2022-06-01")
-    sku("WDYM-XPAK-009","WDYM Holiday Edition Expansion","DIV-01","BRD-01","PL-02","SPL-03","MCAT-01","CAT-01","SCAT-01",14.99,5.50,"2020-10-01")
-    sku("WDYM-XPAK-010","WDYM Gen Z Edition Expansion","DIV-01","BRD-01","PL-02","SPL-04","MCAT-01","CAT-01","SCAT-01",11.99,4.25,"2022-03-01")
-    sku("WDYM-XPAK-011","WDYM Sports Fan Expansion","DIV-01","BRD-01","PL-02","SPL-04","MCAT-01","CAT-01","SCAT-01",11.99,4.25,"2023-01-01")
-    sku("WDYM-XPAK-012","WDYM Gaming Edition Expansion","DIV-01","BRD-01","PL-02","SPL-04","MCAT-01","CAT-01","SCAT-01",11.99,4.25,"2023-06-01")
+    # BRD-01 Depth Filtration — Clariflex™ Lenticular (PL-01)
+    # Sizes: 12", 16", 20" diameter; grades: T1, T2 (coarse→fine)
+    sku("BPF-DFLT-001","Clariflex™ 12\" Depth Filter Sheet T1","DIV-01","BRD-01","PL-01","SPL-01","MCAT-01","CAT-01","SCAT-01", 145, 52, "2020-01-01")
+    sku("BPF-DFLT-002","Clariflex™ 12\" Depth Filter Sheet T2","DIV-01","BRD-01","PL-01","SPL-01","MCAT-01","CAT-01","SCAT-01", 165, 60, "2020-01-01")
+    sku("BPF-DFLT-003","Clariflex™ 16\" Depth Filter Sheet T1","DIV-01","BRD-01","PL-01","SPL-01","MCAT-01","CAT-01","SCAT-01", 245, 88, "2020-01-01")
+    sku("BPF-DFLT-004","Clariflex™ 16\" Depth Filter Sheet T2","DIV-01","BRD-01","PL-01","SPL-01","MCAT-01","CAT-01","SCAT-01", 275, 99, "2020-01-01")
+    sku("BPF-DFLT-005","Clariflex™ 20\" Depth Filter Sheet T1","DIV-01","BRD-01","PL-01","SPL-01","MCAT-01","CAT-01","SCAT-01", 395,142, "2020-01-01")
+    sku("BPF-DFLT-006","Clariflex™ 20\" Depth Filter Sheet T2","DIV-01","BRD-01","PL-01","SPL-01","MCAT-01","CAT-01","SCAT-01", 435,157, "2020-01-01")
+    sku("BPF-DFLT-007","Clariflex™ 20\" Depth Filter Pod XL",  "DIV-01","BRD-01","PL-01","SPL-02","MCAT-01","CAT-01","SCAT-01", 695,250, "2021-03-01")
+    sku("BPF-DFLT-008","Clariflex™ 12\" Depth Filter Pod",     "DIV-01","BRD-01","PL-01","SPL-02","MCAT-01","CAT-01","SCAT-01", 325,117, "2021-03-01")
+    sku("BPF-DFLT-009","Clariflex™ EC Grade Depth Sheet 16\"", "DIV-01","BRD-01","PL-01","SPL-01","MCAT-01","CAT-01","SCAT-01", 310,112, "2022-06-01")
+    sku("BPF-DFLT-010","Clariflex™ EC Grade Depth Sheet 20\"", "DIV-01","BRD-01","PL-01","SPL-01","MCAT-01","CAT-01","SCAT-01", 480,173, "2022-06-01")
 
-    # Licensed
-    sku("LIC-PTRT-001","What Do You Meme? x Pop-Tarts Edition","DIV-01","BRD-01","PL-03","SPL-05","MCAT-02","CAT-06","SCAT-11",24.99,10.50,"2022-09-01")
-    sku("LIC-PTRT-002","Pop-Tarts x Relatable Party Pack","DIV-01","BRD-01","PL-03","SPL-05","MCAT-02","CAT-06","SCAT-11",19.99,8.00,"2023-03-01")
-    sku("LIC-CRTR-001","Hunt A Killer: Sam & Colby Edition","DIV-01","BRD-05","PL-12","SPL-05","MCAT-02","CAT-06","SCAT-12",34.99,14.00,"2023-06-01")
-    sku("LIC-CRTR-002","WDYM Creator Series Vol 1","DIV-01","BRD-01","PL-03","SPL-06","MCAT-02","CAT-06","SCAT-12",24.99,9.50,"2022-06-01")
-    sku("LIC-CRTR-003","WDYM Creator Series Vol 2","DIV-01","BRD-01","PL-03","SPL-06","MCAT-02","CAT-06","SCAT-12",24.99,9.50,"2023-06-01")
-    sku("LIC-CRTR-004","WDYM TikTok Edition","DIV-01","BRD-01","PL-03","SPL-06","MCAT-02","CAT-06","SCAT-12",21.99,8.50,"2023-01-01")
+    # BRD-01 Depth Filtration — SingleClear™ Capsules (PL-02)
+    sku("BPF-DFLT-011","SingleClear™ Depth Capsule 0.5L", "DIV-01","BRD-01","PL-02","SPL-03","MCAT-01","CAT-01","SCAT-02",  58,21, "2020-01-01")
+    sku("BPF-DFLT-012","SingleClear™ Depth Capsule 1.5L", "DIV-01","BRD-01","PL-02","SPL-03","MCAT-01","CAT-01","SCAT-02",  95,34, "2020-01-01")
+    sku("BPF-DFLT-013","SingleClear™ Depth Capsule 5L",   "DIV-01","BRD-01","PL-02","SPL-03","MCAT-01","CAT-01","SCAT-02", 185,67, "2020-06-01")
+    sku("BPF-DFLT-014","SingleClear™ Depth Capsule 20L",  "DIV-01","BRD-01","PL-02","SPL-04","MCAT-01","CAT-01","SCAT-02", 420,151,"2020-06-01")
+    sku("BPF-DFLT-015","SingleClear™ Depth Capsule 60L",  "DIV-01","BRD-01","PL-02","SPL-04","MCAT-01","CAT-01","SCAT-02", 850,306,"2021-01-01")
+    sku("BPF-DFLT-016","SingleClear™ TF Grade Capsule 5L","DIV-01","BRD-01","PL-02","SPL-03","MCAT-01","CAT-01","SCAT-02", 215,77, "2022-03-01")
+    sku("BPF-DFLT-017","SingleClear™ TF Grade Capsule 20L","DIV-01","BRD-01","PL-02","SPL-04","MCAT-01","CAT-01","SCAT-02",475,171,"2022-03-01")
+    # Post-acquisition new products: introduced after TF R&D resources applied
+    sku("BPF-DFLT-018","SingleClear™ Next-Gen Capsule 5L", "DIV-01","BRD-01","PL-02","SPL-03","MCAT-01","CAT-01","SCAT-02",235,78, "2025-10-01", is_new=True)
+    sku("BPF-DFLT-019","SingleClear™ Next-Gen Capsule 20L","DIV-01","BRD-01","PL-02","SPL-04","MCAT-01","CAT-01","SCAT-02",510,169,"2025-10-01", is_new=True)
 
-    # Relatable Party Games
-    sku("REL-PRTY-001","Incohearent","DIV-01","BRD-03","PL-07","SPL-11","MCAT-01","CAT-01","SCAT-01",21.99,8.50,"2019-06-01")
-    sku("REL-PRTY-002","Incohearent Family Edition","DIV-01","BRD-03","PL-07","SPL-11","MCAT-01","CAT-02","SCAT-03",19.99,7.50,"2020-06-01")
-    sku("REL-PRTY-003","Incohearent Fresh Phrases Expansion","DIV-01","BRD-03","PL-07","SPL-11","MCAT-01","CAT-01","SCAT-01",12.99,4.75,"2021-01-01")
-    sku("REL-PRTY-004","For the Girls","DIV-01","BRD-03","PL-07","SPL-11","MCAT-01","CAT-01","SCAT-01",21.99,8.50,"2021-03-01")
-    sku("REL-PRTY-005","For the Girls Expansion","DIV-01","BRD-03","PL-07","SPL-11","MCAT-01","CAT-01","SCAT-01",14.99,5.50,"2022-01-01")
-    sku("REL-PRTY-006","InQueeries","DIV-01","BRD-03","PL-07","SPL-11","MCAT-01","CAT-01","SCAT-01",19.99,7.50,"2022-06-01")
-    sku("REL-PRTY-007","Stir The Pot","DIV-01","BRD-03","PL-07","SPL-11","MCAT-01","CAT-01","SCAT-01",19.99,7.50,"2022-09-01")
-    sku("REL-PRTY-008","Live Laugh Lose","DIV-01","BRD-03","PL-07","SPL-11","MCAT-01","CAT-01","SCAT-01",19.99,7.50,"2022-09-01")
-    sku("REL-PRTY-009","Over-Rated","DIV-01","BRD-03","PL-07","SPL-11","MCAT-01","CAT-01","SCAT-01",19.99,7.50,"2023-03-01")
-    sku("REL-PRTY-010","Asking For A Friend","DIV-01","BRD-03","PL-07","SPL-11","MCAT-01","CAT-01","SCAT-01",21.99,8.50,"2023-06-01")
-    sku("REL-PRTY-011","Who Killed Mia?","DIV-01","BRD-03","PL-07","SPL-11","MCAT-01","CAT-01","SCAT-01",29.99,11.00,"2021-06-01")
-    sku("REL-PRTY-012","Kollide","DIV-01","BRD-03","PL-07","SPL-11","MCAT-01","CAT-01","SCAT-01",24.99,9.50,"2023-09-01")
-    sku("REL-TSCK-001","Tower Stack","DIV-01","BRD-03","PL-08","SPL-13","MCAT-01","CAT-02","SCAT-04",19.99,7.50,"2020-06-01")
-    sku("REL-PRTY-013","Naughty or Nice","DIV-01","BRD-03","PL-07","SPL-11","MCAT-01","CAT-01","SCAT-01",19.99,7.50,"2021-09-01")
-    sku("REL-PRTY-014","Hot Takes","DIV-01","BRD-03","PL-07","SPL-11","MCAT-01","CAT-01","SCAT-01",22.99,8.75,"2022-03-01")
-    sku("REL-PRTY-015","Roast Battle Card Game","DIV-01","BRD-03","PL-07","SPL-11","MCAT-01","CAT-01","SCAT-01",24.99,9.50,"2022-06-01")
-    sku("REL-PRTY-016","This or That: Adult Edition","DIV-01","BRD-03","PL-07","SPL-11","MCAT-01","CAT-01","SCAT-01",17.99,6.75,"2022-09-01")
-    sku("REL-PRTY-017","Conspiracy: The Game","DIV-01","BRD-03","PL-07","SPL-11","MCAT-01","CAT-01","SCAT-01",24.99,9.50,"2023-01-01")
-    sku("REL-PRTY-018","Would You Rather? Party Edition","DIV-01","BRD-03","PL-07","SPL-11","MCAT-01","CAT-01","SCAT-01",17.99,6.50,"2023-03-01")
-    sku("REL-PRTY-019","Sip Sip Hooray","DIV-01","BRD-03","PL-07","SPL-07","MCAT-01","CAT-01","SCAT-02",19.99,7.50,"2023-06-01")
-    sku("REL-PRTY-020","Double Date Card Game","DIV-01","BRD-03","PL-07","SPL-12","MCAT-01","CAT-01","SCAT-01",21.99,8.50,"2023-09-01")
-    sku("REL-PRTY-021","Trauma Dump","DIV-01","BRD-03","PL-07","SPL-11","MCAT-01","CAT-01","SCAT-01",22.99,8.75,"2024-01-01")
-    sku("REL-PRTY-022","Group Chat: The Game","DIV-01","BRD-03","PL-07","SPL-11","MCAT-01","CAT-01","SCAT-01",19.99,7.50,"2024-03-01")
-    sku("REL-PRTY-023","Boundary Issues","DIV-01","BRD-03","PL-07","SPL-12","MCAT-01","CAT-01","SCAT-01",24.99,9.50,"2024-06-01")
+    # BRD-02 Sterile Filtration — SterilPure™ PES (PL-03)
+    sku("BPF-STRL-001","SterilPure™ PES 0.2µm 47mm Disc",    "DIV-01","BRD-02","PL-03","SPL-05","MCAT-01","CAT-02","SCAT-03", 28,10, "2020-01-01")
+    sku("BPF-STRL-002","SterilPure™ PES 0.2µm 142mm Disc",   "DIV-01","BRD-02","PL-03","SPL-05","MCAT-01","CAT-02","SCAT-03", 85,31, "2020-01-01")
+    sku("BPF-STRL-003","SterilPure™ PES 0.2µm 10\" Cartridge","DIV-01","BRD-02","PL-03","SPL-05","MCAT-01","CAT-02","SCAT-03",145,52,"2020-01-01")
+    sku("BPF-STRL-004","SterilPure™ PES 0.2µm 20\" Cartridge","DIV-01","BRD-02","PL-03","SPL-05","MCAT-01","CAT-02","SCAT-03",245,88,"2020-01-01")
+    sku("BPF-STRL-005","SterilPure™ PES 0.45µm 10\" Cartridge","DIV-01","BRD-02","PL-03","SPL-06","MCAT-01","CAT-02","SCAT-03",135,49,"2020-01-01")
+    sku("BPF-STRL-006","SterilPure™ PES 0.45µm 20\" Cartridge","DIV-01","BRD-02","PL-03","SPL-06","MCAT-01","CAT-02","SCAT-03",225,81,"2020-01-01")
+    sku("BPF-STRL-007","SterilPure™ PES BioProcess 0.2µm 30\"","DIV-01","BRD-02","PL-03","SPL-05","MCAT-01","CAT-02","SCAT-03",385,139,"2021-06-01")
+    sku("BPF-STRL-008","SterilPure™ PES 0.2µm EFA 1m²",       "DIV-01","BRD-02","PL-03","SPL-05","MCAT-01","CAT-02","SCAT-03",480,173,"2021-06-01")
 
-    # Buzzed
-    sku("BUZZ-CORE-001","Buzzed Core Game","DIV-01","BRD-02","PL-05","SPL-08","MCAT-01","CAT-01","SCAT-02",19.99,7.50,"2019-01-01")
-    sku("BUZZ-XPAK-001","Buzzed Expansion Pack #1","DIV-01","BRD-02","PL-05","SPL-09","MCAT-01","CAT-01","SCAT-02",14.99,5.50,"2020-01-01")
-    sku("BUZZ-XPAK-002","Buzzed Expansion Pack #2","DIV-01","BRD-02","PL-05","SPL-09","MCAT-01","CAT-01","SCAT-02",14.99,5.50,"2021-01-01")
-    sku("BUZZ-XPAK-003","Buzzed Holiday Edition","DIV-01","BRD-02","PL-05","SPL-09","MCAT-01","CAT-01","SCAT-02",19.99,7.50,"2020-10-01")
-    sku("BUZZ-DXED-001","Buzzed Deluxe Edition","DIV-01","BRD-02","PL-05","SPL-08","MCAT-01","CAT-01","SCAT-02",29.99,11.00,"2022-06-01")
-    sku("BUZZ-SHOT-001","Lil Cheers Shot Glass Set","DIV-01","BRD-02","PL-06","SPL-10","MCAT-02","CAT-04","SCAT-08",14.99,4.50,"2021-06-01")
-    sku("BUZZ-SHOT-002","Lil Cheers Mini Bottle Set","DIV-01","BRD-02","PL-06","SPL-10","MCAT-02","CAT-04","SCAT-08",12.99,3.75,"2022-01-01")
-    sku("BUZZ-SHOT-003","Lil Cheers Party Pack","DIV-01","BRD-02","PL-06","SPL-10","MCAT-02","CAT-04","SCAT-08",19.99,6.50,"2022-09-01")
-    sku("BUZZ-GAME-001","Buzz'd Out: Bar Edition","DIV-01","BRD-02","PL-05","SPL-08","MCAT-01","CAT-01","SCAT-02",24.99,9.50,"2023-01-01")
-    sku("BUZZ-GAME-002","Shots & Dares","DIV-01","BRD-02","PL-05","SPL-09","MCAT-01","CAT-01","SCAT-02",17.99,6.75,"2023-06-01")
-    sku("BUZZ-GAME-003","Tipsy Trivia","DIV-01","BRD-02","PL-05","SPL-09","MCAT-01","CAT-01","SCAT-02",19.99,7.50,"2024-01-01")
-    sku("BUZZ-GAME-004","Last Drink Standing","DIV-01","BRD-02","PL-05","SPL-09","MCAT-01","CAT-01","SCAT-02",22.99,8.75,"2024-06-01")
+    # BRD-02 Sterile Filtration — SterilPure™ PVDF (PL-04)
+    sku("BPF-STRL-009","SterilPure™ PVDF 0.2µm 47mm Disc",    "DIV-01","BRD-02","PL-04","SPL-07","MCAT-01","CAT-02","SCAT-04", 32,12, "2020-01-01")
+    sku("BPF-STRL-010","SterilPure™ PVDF 0.2µm 10\" Cartridge","DIV-01","BRD-02","PL-04","SPL-07","MCAT-01","CAT-02","SCAT-04",165,59,"2020-01-01")
+    sku("BPF-STRL-011","SterilPure™ PVDF 0.2µm 20\" Cartridge","DIV-01","BRD-02","PL-04","SPL-07","MCAT-01","CAT-02","SCAT-04",275,99,"2020-01-01")
+    sku("BPF-STRL-012","SterilPure™ PVDF 0.45µm 10\" Cartridge","DIV-01","BRD-02","PL-04","SPL-08","MCAT-01","CAT-02","SCAT-04",155,56,"2020-01-01")
+    sku("BPF-STRL-013","SterilPure™ PVDF 0.45µm 20\" Cartridge","DIV-01","BRD-02","PL-04","SPL-08","MCAT-01","CAT-02","SCAT-04",260,94,"2020-01-01")
 
-    # Relationship / Family
-    sku("REL-RLSH-001","Let's Get Deep","DIV-01","BRD-03","PL-07","SPL-12","MCAT-01","CAT-01","SCAT-01",21.99,8.50,"2019-06-01")
-    sku("REL-RLSH-002","Let's Get Deep Expansion","DIV-01","BRD-03","PL-07","SPL-12","MCAT-01","CAT-01","SCAT-01",14.99,5.50,"2020-06-01")
-    sku("REL-FMLY-001","Cows in Space","DIV-01","BRD-03","PL-08","SPL-13","MCAT-01","CAT-02","SCAT-04",24.99,9.50,"2024-01-01")
-    sku("REL-FMLY-002","Silly Poopy's Hide & Seek","DIV-01","BRD-03","PL-08","SPL-14","MCAT-01","CAT-02","SCAT-04",12.99,5.00,"2023-06-01")
-    sku("REL-FMLY-003","Grounded for Life","DIV-01","BRD-03","PL-08","SPL-13","MCAT-01","CAT-02","SCAT-03",19.99,7.50,"2023-01-01")
-    sku("REL-FMLY-004","All of Us","DIV-01","BRD-03","PL-08","SPL-13","MCAT-01","CAT-02","SCAT-03",17.99,6.50,"2024-06-01")
+    # BRD-02 FlexFlow™ Sterilizing Capsules (PL-05)
+    sku("BPF-STRL-014","FlexFlow™ Sterilizing Capsule 0.5L","DIV-01","BRD-02","PL-05","SPL-09","MCAT-01","CAT-02","SCAT-05", 75,27,"2020-01-01")
+    sku("BPF-STRL-015","FlexFlow™ Sterilizing Capsule 5L",  "DIV-01","BRD-02","PL-05","SPL-09","MCAT-01","CAT-02","SCAT-05",195,70,"2020-01-01")
+    sku("BPF-STRL-016","FlexFlow™ Sterilizing Capsule 20L", "DIV-01","BRD-02","PL-05","SPL-09","MCAT-01","CAT-02","SCAT-05",445,160,"2021-01-01")
+    sku("BPF-STRL-017","FlexFlow™ End-Use Capsule 0.2µm 1L","DIV-01","BRD-02","PL-05","SPL-10","MCAT-01","CAT-02","SCAT-05",110,40,"2021-06-01")
+    sku("BPF-STRL-018","FlexFlow™ End-Use Capsule 0.2µm 5L","DIV-01","BRD-02","PL-05","SPL-10","MCAT-01","CAT-02","SCAT-05",245,88,"2021-06-01")
+    # Post-acquisition new product: mRNA-optimized sterilizing filter
+    sku("BPF-STRL-019","FlexFlow™ mRNA Grade Capsule 5L","DIV-01","BRD-02","PL-05","SPL-10","MCAT-01","CAT-02","SCAT-05",295,101,"2026-01-01", is_new=True)
 
-    # Outdoor
-    sku("REL-OUTD-001","Iconic Float Giant Ramen Pool Float","DIV-01","BRD-03","PL-09","SPL-15","MCAT-02","CAT-04","SCAT-07",29.99,11.00,"2020-03-01")
-    sku("REL-OUTD-002","Iconic Float Giant Pizza Pool Float","DIV-01","BRD-03","PL-09","SPL-15","MCAT-02","CAT-04","SCAT-07",29.99,11.00,"2020-03-01")
-    sku("REL-OUTD-003","Iconic Float Giant Taco Pool Float","DIV-01","BRD-03","PL-09","SPL-15","MCAT-02","CAT-04","SCAT-07",34.99,13.00,"2021-03-01")
-    sku("REL-OUTD-004","Iconic Float Giant Avocado","DIV-01","BRD-03","PL-09","SPL-15","MCAT-02","CAT-04","SCAT-07",29.99,11.00,"2022-03-01")
+    # BRD-03 Chromatographic Clarification — AEX-Pro™ (PL-06)
+    sku("BPF-CHRO-001","AEX-Pro™ Strong Resin 100mL Pack", "DIV-01","BRD-03","PL-06","SPL-11","MCAT-02","CAT-04","SCAT-08",  480,168,"2020-01-01")
+    sku("BPF-CHRO-002","AEX-Pro™ Strong Resin 1L Pack",    "DIV-01","BRD-03","PL-06","SPL-11","MCAT-02","CAT-04","SCAT-08", 3800,1330,"2020-01-01")
+    sku("BPF-CHRO-003","AEX-Pro™ Strong Resin 5L Pack",    "DIV-01","BRD-03","PL-06","SPL-11","MCAT-02","CAT-04","SCAT-08",17500,6125,"2020-01-01")
+    sku("BPF-CHRO-004","AEX-Pro™ Weak Resin 100mL Pack",   "DIV-01","BRD-03","PL-06","SPL-12","MCAT-02","CAT-04","SCAT-08",  420,147,"2020-01-01")
+    sku("BPF-CHRO-005","AEX-Pro™ Weak Resin 1L Pack",      "DIV-01","BRD-03","PL-06","SPL-12","MCAT-02","CAT-04","SCAT-08", 3200,1120,"2020-01-01")
+    sku("BPF-CHRO-006","AEX-Pro™ Polishing Column 50mL",   "DIV-01","BRD-03","PL-06","SPL-11","MCAT-02","CAT-04","SCAT-08",  650,228,"2021-03-01")
+    sku("BPF-CHRO-007","AEX-Pro™ Polishing Column 500mL",  "DIV-01","BRD-03","PL-06","SPL-11","MCAT-02","CAT-04","SCAT-08", 5200,1820,"2021-03-01")
 
-    # Wellness
-    sku("REL-WLNS-001","Happy Helpers Menstruation Crustacean Heating Pad","DIV-02","BRD-06","PL-10","SPL-17","MCAT-03","CAT-09","SCAT-17",24.99,9.00,"2022-01-01")
-    sku("REL-WLNS-002","Happy Helpers Anxiety Relief Kit","DIV-02","BRD-06","PL-10","SPL-17","MCAT-03","CAT-09","SCAT-17",19.99,7.50,"2022-06-01")
-    sku("REL-WLNS-003","Chill Pill Stress Relief Kit","DIV-02","BRD-06","PL-10","SPL-17","MCAT-03","CAT-09","SCAT-17",22.99,8.50,"2023-06-01")
+    # BRD-03 Chromatographic Clarification — MixMode™ (PL-07)
+    sku("BPF-CHRO-008","MixMode™ Cation Resin 100mL",  "DIV-01","BRD-03","PL-07","SPL-13","MCAT-02","CAT-04","SCAT-09",  520,182,"2020-01-01")
+    sku("BPF-CHRO-009","MixMode™ Cation Resin 1L",     "DIV-01","BRD-03","PL-07","SPL-13","MCAT-02","CAT-04","SCAT-09", 4100,1435,"2020-01-01")
+    sku("BPF-CHRO-010","MixMode™ Anion Resin 100mL",   "DIV-01","BRD-03","PL-07","SPL-14","MCAT-02","CAT-04","SCAT-09",  490,172,"2020-06-01")
+    sku("BPF-CHRO-011","MixMode™ Anion Resin 1L",      "DIV-01","BRD-03","PL-07","SPL-14","MCAT-02","CAT-04","SCAT-09", 3900,1365,"2020-06-01")
+    sku("BPF-CHRO-012","MixMode™ HCP Reduction Column","DIV-01","BRD-03","PL-07","SPL-14","MCAT-02","CAT-04","SCAT-09", 6800,2380,"2022-01-01")
+    # Post-acquisition: TF-developed next-gen resin
+    sku("BPF-CHRO-013","MixMode™ Next-Gen Cation 1L","DIV-01","BRD-03","PL-07","SPL-13","MCAT-02","CAT-04","SCAT-09",4500,1440,"2026-03-01", is_new=True)
 
-    # Collectibles
-    sku("REL-WBSB-001","WabiSabi Kitty Club Blind Box","DIV-02","BRD-06","PL-10","SPL-18","MCAT-02","CAT-06","SCAT-11",14.99,5.00,"2023-01-01")
-    sku("REL-WBSB-002","WabiSabi Kitty Club Series 2","DIV-02","BRD-06","PL-10","SPL-18","MCAT-02","CAT-06","SCAT-11",16.99,5.75,"2024-06-01")
-    sku("REL-PETS-001","Relatable Pets Pawty Time Game","DIV-01","BRD-03","PL-08","SPL-13","MCAT-01","CAT-02","SCAT-03",19.99,7.50,"2023-09-01")
+    # BRD-04 Viral Clearance — ViralGuard™ (PL-08)
+    sku("BPF-VIRL-001","ViralGuard™ Parvo Filter 25cm²",  "DIV-01","BRD-04","PL-08","SPL-15","MCAT-01","CAT-03","SCAT-06", 890,312, "2020-01-01")
+    sku("BPF-VIRL-002","ViralGuard™ Parvo Filter 100cm²", "DIV-01","BRD-04","PL-08","SPL-15","MCAT-01","CAT-03","SCAT-06",2800,980, "2020-01-01")
+    sku("BPF-VIRL-003","ViralGuard™ Parvo Capsule 0.1m²", "DIV-01","BRD-04","PL-08","SPL-15","MCAT-01","CAT-03","SCAT-06",3500,1225,"2020-01-01")
+    sku("BPF-VIRL-004","ViralGuard™ Parvo Cassette 1m²",  "DIV-01","BRD-04","PL-08","SPL-16","MCAT-01","CAT-03","SCAT-06",8500,2975,"2021-01-01")
+    sku("BPF-VIRL-005","ViralGuard™ Retrovirus Filter 100cm²","DIV-01","BRD-04","PL-08","SPL-15","MCAT-01","CAT-03","SCAT-06",3200,1120,"2021-06-01")
 
-    # More originals
-    sku("REL-PRTY-024","Burn Book: The Game","DIV-01","BRD-03","PL-07","SPL-11","MCAT-01","CAT-01","SCAT-01",22.99,8.75,"2024-09-01")
-    sku("REL-FMLY-005","Dino Dig: Kids Edition","DIV-01","BRD-03","PL-08","SPL-14","MCAT-01","CAT-02","SCAT-04",17.99,6.75,"2024-03-01")
-    sku("REL-RLSH-003","Couple Vibes","DIV-01","BRD-03","PL-07","SPL-12","MCAT-01","CAT-01","SCAT-01",21.99,8.50,"2024-01-01")
-    sku("REL-FMLY-006","Family Drama: The Game","DIV-01","BRD-03","PL-08","SPL-13","MCAT-01","CAT-02","SCAT-03",19.99,7.50,"2024-09-01")
+    # BRD-04 Viral Clearance — ParvoSure™ 20nm (PL-09)
+    sku("BPF-VIRL-006","ParvoSure™ 20nm Filter 25cm²", "DIV-01","BRD-04","PL-09","SPL-17","MCAT-01","CAT-03","SCAT-07",1200, 420,"2020-01-01")
+    sku("BPF-VIRL-007","ParvoSure™ 20nm Filter 100cm²","DIV-01","BRD-04","PL-09","SPL-17","MCAT-01","CAT-03","SCAT-07",4200,1470,"2020-01-01")
+    sku("BPF-VIRL-008","ParvoSure™ 20nm Capsule 0.1m²","DIV-01","BRD-04","PL-09","SPL-17","MCAT-01","CAT-03","SCAT-07",4800,1680,"2020-06-01")
+    sku("BPF-VIRL-009","ParvoSure™ 20nm Cassette 1m²", "DIV-01","BRD-04","PL-09","SPL-17","MCAT-01","CAT-03","SCAT-07",11000,3850,"2021-01-01")
+    # Post-acquisition: enhanced 19nm product
+    sku("BPF-VIRL-010","ParvoSure™ Plus 19nm Capsule 0.1m²","DIV-01","BRD-04","PL-09","SPL-17","MCAT-01","CAT-03","SCAT-07",5600,1790,"2026-01-01", is_new=True)
 
-    # Bee Street Games
-    sku("BSG-CORE-001","Bee Street Games Flagship","DIV-01","BRD-04","PL-11","SPL-19","MCAT-01","CAT-01","SCAT-01",24.99,9.50,"2021-06-01")
-    sku("BSG-CORE-002","Bee Street Buzz Edition","DIV-01","BRD-04","PL-11","SPL-19","MCAT-01","CAT-01","SCAT-01",22.99,8.75,"2022-01-01")
-    sku("BSG-CORE-003","Bee Street Family Hive","DIV-01","BRD-04","PL-11","SPL-19","MCAT-01","CAT-02","SCAT-03",19.99,7.50,"2022-06-01")
-    sku("BSG-CORE-004","Bee Street Party Pack","DIV-01","BRD-04","PL-11","SPL-19","MCAT-01","CAT-01","SCAT-01",27.99,10.50,"2022-09-01")
-    sku("BSG-CARD-001","Bee Street Card Duel","DIV-01","BRD-04","PL-11","SPL-19","MCAT-01","CAT-01","SCAT-01",17.99,6.75,"2023-01-01")
-    sku("BSG-CARD-002","Bee Street Expansion Vol 1","DIV-01","BRD-04","PL-11","SPL-19","MCAT-01","CAT-01","SCAT-01",12.99,4.75,"2023-06-01")
-    sku("BSG-CARD-003","Bee Street Strategy Edition","DIV-01","BRD-04","PL-11","SPL-19","MCAT-01","CAT-01","SCAT-01",29.99,11.00,"2023-09-01")
-    sku("BSG-CARD-004","Bee Street Kids Quest","DIV-01","BRD-04","PL-11","SPL-19","MCAT-01","CAT-02","SCAT-03",19.99,7.50,"2024-03-01")
+    # ------------------------------------------------------------------
+    # DIV-02 Healthcare & Industrial Filtration
+    # ------------------------------------------------------------------
 
-    # Hunt A Killer
-    sku("HAK-CORE-001","Hunt A Killer Season 1","DIV-01","BRD-05","PL-12","SPL-20","MCAT-01","CAT-03","SCAT-05",29.99,12.00,"2019-01-01")
-    sku("HAK-CORE-002","Hunt A Killer Season 2","DIV-01","BRD-05","PL-12","SPL-20","MCAT-01","CAT-03","SCAT-05",29.99,12.00,"2020-01-01")
-    sku("HAK-CORE-003","Hunt A Killer Season 3","DIV-01","BRD-05","PL-12","SPL-20","MCAT-01","CAT-03","SCAT-05",29.99,12.00,"2021-01-01")
-    sku("HAK-SUBS-001","Hunt A Killer Subscription Box","DIV-01","BRD-05","PL-12","SPL-20","MCAT-01","CAT-03","SCAT-06",29.99,11.00,"2019-06-01")
-    sku("HAK-MINI-001","Hunt A Killer Mini Mystery","DIV-01","BRD-05","PL-12","SPL-20","MCAT-01","CAT-03","SCAT-05",14.99,5.50,"2022-01-01")
-    sku("HAK-MINI-002","Hunt A Killer Holiday Special","DIV-01","BRD-05","PL-12","SPL-20","MCAT-01","CAT-03","SCAT-05",19.99,7.50,"2022-10-01")
-    sku("HAK-MINI-003","Hunt A Killer: Beach House","DIV-01","BRD-05","PL-12","SPL-20","MCAT-01","CAT-03","SCAT-05",24.99,9.50,"2023-06-01")
-    sku("HAK-MINI-004","Hunt A Killer: Cold Case Files","DIV-01","BRD-05","PL-12","SPL-20","MCAT-01","CAT-03","SCAT-05",29.99,11.00,"2024-01-01")
+    # BRD-05 Medical Device Filtration — MedLine™ Syringe Filters (PL-10)
+    sku("HIF-MEDF-001","MedLine™ Syringe Filter PVDF 0.22µm 13mm",  "DIV-02","BRD-05","PL-10","SPL-18","MCAT-02","CAT-05","SCAT-10", 12,  4, "2020-01-01")
+    sku("HIF-MEDF-002","MedLine™ Syringe Filter PVDF 0.22µm 25mm",  "DIV-02","BRD-05","PL-10","SPL-18","MCAT-02","CAT-05","SCAT-10", 18,  7, "2020-01-01")
+    sku("HIF-MEDF-003","MedLine™ Syringe Filter PES 0.22µm 25mm",   "DIV-02","BRD-05","PL-10","SPL-18","MCAT-02","CAT-05","SCAT-10", 15,  6, "2020-01-01")
+    sku("HIF-MEDF-004","MedLine™ Syringe Filter Nylon 0.45µm 25mm", "DIV-02","BRD-05","PL-10","SPL-19","MCAT-02","CAT-05","SCAT-10", 14,  5, "2020-01-01")
+    sku("HIF-MEDF-005","MedLine™ Syringe Filter MCE 0.45µm 47mm",   "DIV-02","BRD-05","PL-10","SPL-19","MCAT-02","CAT-05","SCAT-10", 22,  8, "2020-01-01")
+    sku("HIF-MEDF-006","MedLine™ Syringe Filter PTFE 0.22µm 13mm",  "DIV-02","BRD-05","PL-10","SPL-18","MCAT-02","CAT-05","SCAT-10", 20,  7, "2021-01-01")
+    sku("HIF-MEDF-007","MedLine™ Syringe Filter PTFE 0.45µm 25mm",  "DIV-02","BRD-05","PL-10","SPL-19","MCAT-02","CAT-05","SCAT-10", 24,  9, "2021-01-01")
+    sku("HIF-MEDF-008","MedLine™ Bulk Pack PVDF 0.22µm 25mm 100ct", "DIV-02","BRD-05","PL-10","SPL-18","MCAT-02","CAT-05","SCAT-10",145, 52, "2021-06-01")
+    sku("HIF-MEDF-009","MedLine™ Bulk Pack PES 0.22µm 25mm 100ct",  "DIV-02","BRD-05","PL-10","SPL-18","MCAT-02","CAT-05","SCAT-10",125, 45, "2021-06-01")
 
-    # ESP — original trio
-    sku("REL-ESP-001","Emotional Support Pals — French Fries","DIV-02","BRD-06","PL-13","SPL-21","MCAT-03","CAT-07","SCAT-13",24.99,8.50,"2020-01-01")
-    sku("REL-ESP-002","Emotional Support Pals — Flowers","DIV-02","BRD-06","PL-13","SPL-21","MCAT-03","CAT-07","SCAT-13",24.99,8.50,"2020-01-01")
-    sku("REL-ESP-003","Emotional Support Pals — Mushroom","DIV-02","BRD-06","PL-13","SPL-21","MCAT-03","CAT-07","SCAT-13",24.99,8.50,"2020-01-01")
+    # BRD-05 Medical Device — AirShield™ Venting Filters (PL-11)
+    sku("HIF-MEDF-010","AirShield™ Vent Filter PTFE 0.2µm 10mm", "DIV-02","BRD-05","PL-11","SPL-20","MCAT-02","CAT-05","SCAT-11", 35, 13,"2020-01-01")
+    sku("HIF-MEDF-011","AirShield™ Vent Filter PTFE 0.2µm 25mm", "DIV-02","BRD-05","PL-11","SPL-20","MCAT-02","CAT-05","SCAT-11", 52, 19,"2020-01-01")
+    sku("HIF-MEDF-012","AirShield™ Vent Filter PTFE 0.2µm 50mm", "DIV-02","BRD-05","PL-11","SPL-20","MCAT-02","CAT-05","SCAT-11", 85, 31,"2020-01-01")
+    sku("HIF-MEDF-013","AirShield™ Hydrophilic Vent 0.2µm 25mm", "DIV-02","BRD-05","PL-11","SPL-21","MCAT-02","CAT-05","SCAT-11", 58, 21,"2021-01-01")
 
-    # ESP expansion — 27 more
-    esp_chars = [
-        ("004","Axolotl",24.99,8.50,"2021-01-01"),("005","Ghost",24.99,8.50,"2021-03-01"),
-        ("006","Frog",24.99,8.50,"2021-06-01"),("007","Cactus",24.99,8.50,"2021-06-01"),
-        ("008","Cloud",22.99,7.75,"2021-09-01"),("009","Avocado",24.99,8.50,"2021-09-01"),
-        ("010","Rainbow",27.99,9.50,"2021-12-01"),("011","Pizza Slice",24.99,8.50,"2022-01-01"),
-        ("012","Taco",24.99,8.50,"2022-03-01"),("013","Sushi",27.99,9.50,"2022-03-01"),
-        ("014","Dinosaur",29.99,10.00,"2022-06-01"),("015","Crab",24.99,8.50,"2022-06-01"),
-        ("016","Jellyfish",27.99,9.50,"2022-09-01"),("017","Succulent",22.99,7.75,"2022-09-01"),
-        ("018","Croissant",24.99,8.50,"2022-12-01"),("019","Boba Tea",27.99,9.50,"2023-01-01"),
-        ("020","Hot Dog",22.99,7.75,"2023-03-01"),("021","Strawberry",24.99,8.50,"2023-03-01"),
-        ("022","Donut",24.99,8.50,"2023-06-01"),("023","Narwhal",29.99,10.00,"2023-06-01"),
-        ("024","Sloth",27.99,9.50,"2023-09-01"),("025","Cactus Deluxe",34.99,12.00,"2023-09-01"),
-        ("026","Penguin",24.99,8.50,"2023-12-01"),("027","Bear",27.99,9.50,"2024-01-01"),
-        ("028","Shark",29.99,10.00,"2024-03-01"),("029","Flamingo",27.99,9.50,"2024-06-01"),
-        ("030","Bunny",24.99,8.50,"2024-09-01"),
-    ]
-    for num, name, price, cost, launch in esp_chars:
-        sku(f"REL-ESP-{num}", f"Emotional Support Pals — {name}",
-            "DIV-02","BRD-06","PL-13","SPL-21","MCAT-03","CAT-07","SCAT-13",
-            price, cost, launch)
+    # BRD-05 Medical Device — SafeFlow™ IV Filters (PL-12)
+    sku("HIF-MEDF-014","SafeFlow™ IV Filter 0.2µm In-Line",     "DIV-02","BRD-05","PL-12","SPL-22","MCAT-02","CAT-05","SCAT-12", 45, 16,"2020-01-01")
+    sku("HIF-MEDF-015","SafeFlow™ IV Filter 0.2µm Luer Lock",   "DIV-02","BRD-05","PL-12","SPL-22","MCAT-02","CAT-05","SCAT-12", 55, 20,"2020-01-01")
+    sku("HIF-MEDF-016","SafeFlow™ IV Filter 1.2µm Lipid Guard",  "DIV-02","BRD-05","PL-12","SPL-23","MCAT-02","CAT-05","SCAT-12", 65, 23,"2020-01-01")
+    sku("HIF-MEDF-017","SafeFlow™ IV Filter 1.2µm Gravity Set",  "DIV-02","BRD-05","PL-12","SPL-23","MCAT-02","CAT-05","SCAT-12", 72, 26,"2020-01-01")
+    sku("HIF-MEDF-018","SafeFlow™ IV Filter 0.2µm Add-On",       "DIV-02","BRD-05","PL-12","SPL-22","MCAT-02","CAT-05","SCAT-12", 42, 15,"2021-06-01")
 
-    # Cozy Concepts
-    sku("REL-COZY-001","Cozy Concepts Blanket Classic","DIV-02","BRD-06","PL-14","SPL-23","MCAT-02","CAT-05","SCAT-09",39.99,14.00,"2021-09-01")
-    sku("REL-COZY-002","Cozy Concepts Meme Edition","DIV-02","BRD-06","PL-14","SPL-23","MCAT-02","CAT-05","SCAT-09",44.99,15.50,"2022-06-01")
-    sku("REL-COZY-003","Cozy Concepts Holiday Blanket","DIV-02","BRD-06","PL-14","SPL-23","MCAT-02","CAT-05","SCAT-09",44.99,15.50,"2022-10-01")
-    sku("REL-COZY-004","Cozy Concepts Weighted Blanket","DIV-02","BRD-06","PL-14","SPL-23","MCAT-02","CAT-05","SCAT-09",59.99,21.00,"2023-06-01")
-    sku("REL-COZY-005","Cozy Concepts Mini Throw","DIV-02","BRD-06","PL-14","SPL-23","MCAT-02","CAT-05","SCAT-09",29.99,10.50,"2024-01-01")
+    # BRD-06 Industrial Process — InduPure™ Liquid (PL-13)
+    sku("HIF-INDF-001","InduPure™ Bag Filter 5µm P1 Size 1",    "DIV-02","BRD-06","PL-13","SPL-24","MCAT-02","CAT-06","SCAT-13", 38,14,"2020-01-01")
+    sku("HIF-INDF-002","InduPure™ Bag Filter 5µm P1 Size 2",    "DIV-02","BRD-06","PL-13","SPL-24","MCAT-02","CAT-06","SCAT-13", 48,17,"2020-01-01")
+    sku("HIF-INDF-003","InduPure™ Cartridge 5µm 10\" PP",       "DIV-02","BRD-06","PL-13","SPL-25","MCAT-02","CAT-06","SCAT-13", 42,15,"2020-01-01")
+    sku("HIF-INDF-004","InduPure™ Cartridge 1µm 10\" PP",       "DIV-02","BRD-06","PL-13","SPL-25","MCAT-02","CAT-06","SCAT-13", 48,17,"2020-01-01")
+    sku("HIF-INDF-005","InduPure™ Cartridge 0.2µm 20\" PES",    "DIV-02","BRD-06","PL-13","SPL-25","MCAT-02","CAT-06","SCAT-13",125,45,"2020-01-01")
+    sku("HIF-INDF-006","InduPure™ Strainer Element 50µm",       "DIV-02","BRD-06","PL-13","SPL-24","MCAT-02","CAT-06","SCAT-13", 85,31,"2021-01-01")
+    sku("HIF-INDF-007","InduPure™ High-Flow Cartridge 5µm 40\"","DIV-02","BRD-06","PL-13","SPL-25","MCAT-02","CAT-06","SCAT-13",195,70,"2021-06-01")
+    sku("HIF-INDF-008","InduPure™ High-Flow Cartridge 1µm 40\"","DIV-02","BRD-06","PL-13","SPL-25","MCAT-02","CAT-06","SCAT-13",215,77,"2021-06-01")
+    sku("HIF-INDF-009","InduPure™ Pleated Cartridge 0.45µm 30\"","DIV-02","BRD-06","PL-13","SPL-25","MCAT-02","CAT-06","SCAT-13",155,56,"2022-01-01")
+    sku("HIF-INDF-010","InduPure™ Pleated Cartridge 0.2µm 30\"","DIV-02","BRD-06","PL-13","SPL-25","MCAT-02","CAT-06","SCAT-13",175,63,"2022-01-01")
 
-    # Hugimals World (all is_new_sku=True)
-    sku("HUG-CLAS-001","Sam the Sloth","DIV-03","BRD-07","PL-15","SPL-24","MCAT-03","CAT-08","SCAT-15",68.00,22.00,"2024-07-01",is_new=True)
-    sku("HUG-CLAS-002","Harper the Pig","DIV-03","BRD-07","PL-15","SPL-24","MCAT-03","CAT-08","SCAT-15",68.00,22.00,"2024-07-01",is_new=True)
-    sku("HUG-CLAS-003","Forrest the Fox","DIV-03","BRD-07","PL-15","SPL-24","MCAT-03","CAT-08","SCAT-15",68.00,22.00,"2024-07-01",is_new=True)
-    sku("HUG-CLAS-004","Bowie the Panda","DIV-03","BRD-07","PL-15","SPL-24","MCAT-03","CAT-08","SCAT-15",68.00,22.00,"2024-07-01",is_new=True)
-    sku("HUG-CLAS-005","Berkeley the Bear","DIV-03","BRD-07","PL-15","SPL-24","MCAT-03","CAT-08","SCAT-15",68.00,22.00,"2024-07-01",is_new=True)
-    sku("HUG-CLAS-006","Luna the Bunny","DIV-03","BRD-07","PL-15","SPL-24","MCAT-03","CAT-08","SCAT-15",68.00,22.00,"2024-07-01",is_new=True)
-    sku("HUG-CLAS-007","Charlie the Cat","DIV-03","BRD-07","PL-15","SPL-24","MCAT-03","CAT-08","SCAT-15",68.00,22.00,"2024-07-01",is_new=True)
-    sku("HUG-CLAS-008","Mochi the Panda Cub","DIV-03","BRD-07","PL-15","SPL-24","MCAT-03","CAT-08","SCAT-15",68.00,22.00,"2024-07-01",is_new=True)
-    sku("HUG-CLAS-009","Finn the Seal","DIV-03","BRD-07","PL-15","SPL-24","MCAT-03","CAT-08","SCAT-15",68.00,22.00,"2024-07-01",is_new=True)
-    sku("HUG-CLAS-010","Daisy the Cow","DIV-03","BRD-07","PL-15","SPL-24","MCAT-03","CAT-08","SCAT-15",68.00,22.00,"2024-07-01",is_new=True)
-    sku("HUG-RND-001","Pax the Penguin Hugaround","DIV-03","BRD-07","PL-16","SPL-25","MCAT-03","CAT-08","SCAT-16",48.00,16.00,"2024-07-01",is_new=True)
-    sku("HUG-RND-002","Ollie the Orangutan Hugaround","DIV-03","BRD-07","PL-16","SPL-25","MCAT-03","CAT-08","SCAT-16",48.00,16.00,"2024-07-01",is_new=True)
-    sku("HUG-RND-003","Sawyer the Sloth Hugaround","DIV-03","BRD-07","PL-16","SPL-25","MCAT-03","CAT-08","SCAT-16",48.00,16.00,"2024-07-01",is_new=True)
-    sku("HUG-RND-004","Indigo the Octopus Hugaround","DIV-03","BRD-07","PL-16","SPL-25","MCAT-03","CAT-08","SCAT-16",48.00,16.00,"2024-07-01",is_new=True)
-    sku("HUG-RND-005","Ruby the Raccoon Hugaround","DIV-03","BRD-07","PL-16","SPL-25","MCAT-03","CAT-08","SCAT-16",48.00,16.00,"2024-07-01",is_new=True)
-    sku("HUG-RND-006","Theo the Tiger Hugaround","DIV-03","BRD-07","PL-16","SPL-25","MCAT-03","CAT-08","SCAT-16",48.00,16.00,"2024-07-01",is_new=True)
-    sku("HUG-RND-007","Ivy the Iguana Hugaround","DIV-03","BRD-07","PL-16","SPL-25","MCAT-03","CAT-08","SCAT-16",48.00,16.00,"2024-07-01",is_new=True)
-    sku("HUG-RND-008","Cleo the Chameleon Hugaround","DIV-03","BRD-07","PL-16","SPL-25","MCAT-03","CAT-08","SCAT-16",48.00,16.00,"2024-07-01",is_new=True)
-    sku("HUG-BERK-001","Berkeley the Bat","DIV-03","BRD-07","PL-15","SPL-24","MCAT-03","CAT-08","SCAT-15",45.00,15.00,"2024-07-01",is_new=True)
-    sku("HUG-BERK-002","Berkeley the Bat Glow Edition","DIV-03","BRD-07","PL-15","SPL-24","MCAT-03","CAT-08","SCAT-15",49.00,16.50,"2024-10-01",is_new=True)
-    sku("HUG-BABY-001","Hug Baby Bowie the Panda","DIV-03","BRD-07","PL-17","SPL-26","MCAT-03","CAT-08","SCAT-15",12.00,4.00,"2024-10-01",is_new=True)
-    sku("HUG-BABY-002","Hug Baby Sam the Sloth","DIV-03","BRD-07","PL-17","SPL-26","MCAT-03","CAT-08","SCAT-15",12.00,4.00,"2024-10-01",is_new=True)
-    sku("HUG-BABY-003","Hug Baby Forrest the Fox","DIV-03","BRD-07","PL-17","SPL-26","MCAT-03","CAT-08","SCAT-15",12.00,4.00,"2024-10-01",is_new=True)
-    sku("HUG-BABY-004","Hug Baby Luna the Bunny","DIV-03","BRD-07","PL-17","SPL-26","MCAT-03","CAT-08","SCAT-15",12.00,4.00,"2024-10-01",is_new=True)
-    sku("HUG-BNDL-001","Sloth With Heart Bundle","DIV-03","BRD-07","PL-17","SPL-26","MCAT-03","CAT-08","SCAT-15",104.00,34.00,"2024-10-01",is_new=True)
-    sku("HUG-BNDL-002","Red and Rose Hearts Bundle","DIV-03","BRD-07","PL-17","SPL-26","MCAT-03","CAT-08","SCAT-15",126.00,41.00,"2024-10-01",is_new=True)
-    sku("HUG-BNDL-003","Black and White Hearts Bundle","DIV-03","BRD-07","PL-17","SPL-26","MCAT-03","CAT-08","SCAT-15",126.00,41.00,"2024-10-01",is_new=True)
-    sku("HUG-BNDL-004","Hugaround + Classic Bundle","DIV-03","BRD-07","PL-17","SPL-26","MCAT-03","CAT-08","SCAT-15",110.00,36.00,"2024-11-01",is_new=True)
-    sku("HUG-ACCS-001","Weighted Hug Sweatshirt","DIV-03","BRD-07","PL-17","SPL-27","MCAT-03","CAT-08","SCAT-15",128.00,42.00,"2024-11-01",is_new=True)
-    sku("HUG-ACCS-002","Hugimals Travel Bag","DIV-03","BRD-07","PL-17","SPL-27","MCAT-03","CAT-08","SCAT-15",24.99,8.50,"2024-11-01",is_new=True)
+    # BRD-06 Industrial — GasGuard™ (PL-14)
+    sku("HIF-INDF-011","GasGuard™ Process Gas Filter 0.2µm 10\"","DIV-02","BRD-06","PL-14","SPL-26","MCAT-02","CAT-06","SCAT-14",135,49,"2020-01-01")
+    sku("HIF-INDF-012","GasGuard™ Process Gas Filter 0.2µm 20\"","DIV-02","BRD-06","PL-14","SPL-26","MCAT-02","CAT-06","SCAT-14",225,81,"2020-01-01")
+    sku("HIF-INDF-013","GasGuard™ Compressed Air Filter 0.2µm", "DIV-02","BRD-06","PL-14","SPL-27","MCAT-02","CAT-06","SCAT-14", 98,35,"2020-01-01")
+    sku("HIF-INDF-014","GasGuard™ Sterile Vent PTFE 0.2µm 20\"","DIV-02","BRD-06","PL-14","SPL-27","MCAT-02","CAT-06","SCAT-14",195,70,"2021-01-01")
+    sku("HIF-INDF-015","GasGuard™ High-Flow Vent Filter 1µm 30\"","DIV-02","BRD-06","PL-14","SPL-27","MCAT-02","CAT-06","SCAT-14",245,88,"2022-03-01")
+
+    # ------------------------------------------------------------------
+    # DIV-03 Membranes (incl. OEM)
+    # Demand driver: tracks customer's production schedule, not end-patient volume.
+    # ------------------------------------------------------------------
+
+    # BRD-07 OEM Membrane Media — BattSep™ Battery Separators (PL-15)
+    # Large-volume, production-schedule-driven; EV battery boom from 2022
+    sku("MEM-OEMM-001","BattSep™ Li-Ion Separator 15µm 1m² Roll",  "DIV-03","BRD-07","PL-15","SPL-28","MCAT-03","CAT-07","SCAT-15", 42,15,"2020-01-01")
+    sku("MEM-OEMM-002","BattSep™ Li-Ion Separator 12µm 1m² Roll",  "DIV-03","BRD-07","PL-15","SPL-28","MCAT-03","CAT-07","SCAT-15", 55,20,"2020-01-01")
+    sku("MEM-OEMM-003","BattSep™ Li-Ion Separator 9µm 1m² Roll",   "DIV-03","BRD-07","PL-15","SPL-28","MCAT-03","CAT-07","SCAT-15", 72,26,"2021-01-01")
+    sku("MEM-OEMM-004","BattSep™ Coated Separator 15µm 1m² Roll",  "DIV-03","BRD-07","PL-15","SPL-28","MCAT-03","CAT-07","SCAT-15", 68,24,"2021-06-01")
+    sku("MEM-OEMM-005","BattSep™ Solid-State Precursor 20µm 1m²",  "DIV-03","BRD-07","PL-15","SPL-29","MCAT-03","CAT-07","SCAT-16",125,43,"2022-06-01")
+    sku("MEM-OEMM-006","BattSep™ Solid-State Composite 15µm 1m²",  "DIV-03","BRD-07","PL-15","SPL-29","MCAT-03","CAT-07","SCAT-16",175,61,"2022-09-01")
+    sku("MEM-OEMM-007","BattSep™ Next-Gen Solid-State 10µm 1m²",   "DIV-03","BRD-07","PL-15","SPL-29","MCAT-03","CAT-07","SCAT-16",220,77,"2023-06-01")
+    # Post-acquisition next-gen
+    sku("MEM-OEMM-008","BattSep™ Nano-Coat Separator 9µm 1m² Roll","DIV-03","BRD-07","PL-15","SPL-28","MCAT-03","CAT-07","SCAT-15", 85,28,"2025-10-01", is_new=True)
+
+    # BRD-07 OEM — UPW-Mem™ Ultra-Pure Water (PL-16)
+    sku("MEM-OEMM-009","UPW-Mem™ Ultrafiltration 10kDa 1m²",  "DIV-03","BRD-07","PL-16","SPL-30","MCAT-03","CAT-08","SCAT-17",185,65,"2020-01-01")
+    sku("MEM-OEMM-010","UPW-Mem™ Ultrafiltration 30kDa 1m²",  "DIV-03","BRD-07","PL-16","SPL-30","MCAT-03","CAT-08","SCAT-17",165,58,"2020-01-01")
+    sku("MEM-OEMM-011","UPW-Mem™ Nanofiltration 200Da 1m²",   "DIV-03","BRD-07","PL-16","SPL-31","MCAT-03","CAT-08","SCAT-17",245,86,"2020-06-01")
+    sku("MEM-OEMM-012","UPW-Mem™ RO Membrane Semiconductor 1m²","DIV-03","BRD-07","PL-16","SPL-31","MCAT-03","CAT-08","SCAT-17",320,112,"2021-01-01")
+    sku("MEM-OEMM-013","UPW-Mem™ Polishing UF 5kDa 1m²",      "DIV-03","BRD-07","PL-16","SPL-30","MCAT-03","CAT-08","SCAT-17",215,75,"2022-01-01")
+    sku("MEM-OEMM-014","UPW-Mem™ High-Flux UF Spiral 4040",    "DIV-03","BRD-07","PL-16","SPL-31","MCAT-03","CAT-08","SCAT-17",480,168,"2022-06-01")
+
+    # BRD-07 OEM — MedOEM™ Medical OEM Membranes (PL-17)
+    sku("MEM-OEMM-015","MedOEM™ PES Flat Sheet 0.2µm 1m²",  "DIV-03","BRD-07","PL-17","SPL-32","MCAT-03","CAT-09","SCAT-18", 95,33,"2020-01-01")
+    sku("MEM-OEMM-016","MedOEM™ PVDF Flat Sheet 0.2µm 1m²", "DIV-03","BRD-07","PL-17","SPL-32","MCAT-03","CAT-09","SCAT-18",115,40,"2020-01-01")
+    sku("MEM-OEMM-017","MedOEM™ Hollow Fiber UF PES 1m²",   "DIV-03","BRD-07","PL-17","SPL-33","MCAT-03","CAT-09","SCAT-18",245,86,"2020-01-01")
+    sku("MEM-OEMM-018","MedOEM™ Hollow Fiber MF PP 1m²",    "DIV-03","BRD-07","PL-17","SPL-33","MCAT-03","CAT-09","SCAT-18",185,65,"2021-01-01")
+    sku("MEM-OEMM-019","MedOEM™ Hemodialysis Membrane 1m²", "DIV-03","BRD-07","PL-17","SPL-33","MCAT-03","CAT-09","SCAT-18",380,133,"2021-06-01")
+    sku("MEM-OEMM-020","MedOEM™ Oxygenator Membrane 1m²",   "DIV-03","BRD-07","PL-17","SPL-33","MCAT-03","CAT-09","SCAT-18",520,182,"2022-01-01")
+
+    # BRD-08 Specialty Membranes — NanoFilt™ (PL-18)
+    sku("MEM-SPEC-001","NanoFilt™ High-Performance PVDF 0.1µm 1m²","DIV-03","BRD-08","PL-18","SPL-34","MCAT-03","CAT-08","SCAT-17",185,65,"2020-01-01")
+    sku("MEM-SPEC-002","NanoFilt™ High-Performance PES 0.05µm 1m²","DIV-03","BRD-08","PL-18","SPL-34","MCAT-03","CAT-08","SCAT-17",225,79,"2020-01-01")
+    sku("MEM-SPEC-003","NanoFilt™ Research Grade PTFE 0.1µm 1m²",  "DIV-03","BRD-08","PL-18","SPL-35","MCAT-03","CAT-08","SCAT-17",295,103,"2020-01-01")
+    sku("MEM-SPEC-004","NanoFilt™ Research Grade PVDF 0.02µm 1m²", "DIV-03","BRD-08","PL-18","SPL-35","MCAT-03","CAT-08","SCAT-17",385,135,"2020-01-01")
+    sku("MEM-SPEC-005","NanoFilt™ Ceramic Alumina 0.2µm Disc",      "DIV-03","BRD-08","PL-18","SPL-34","MCAT-03","CAT-08","SCAT-17",145,51,"2021-06-01")
+    sku("MEM-SPEC-006","NanoFilt™ Ceramic Titania 0.05µm Disc",     "DIV-03","BRD-08","PL-18","SPL-34","MCAT-03","CAT-08","SCAT-17",185,65,"2021-06-01")
+    sku("MEM-SPEC-007","NanoFilt™ Track-Etched PC 0.4µm 25mm",      "DIV-03","BRD-08","PL-18","SPL-35","MCAT-03","CAT-08","SCAT-17", 28,10,"2020-01-01")
+    sku("MEM-SPEC-008","NanoFilt™ Track-Etched PC 0.2µm 25mm",      "DIV-03","BRD-08","PL-18","SPL-35","MCAT-03","CAT-08","SCAT-17", 35,12,"2020-01-01")
+    sku("MEM-SPEC-009","NanoFilt™ Track-Etched PC 0.1µm 47mm",      "DIV-03","BRD-08","PL-18","SPL-35","MCAT-03","CAT-08","SCAT-17", 68,24,"2021-01-01")
+    sku("MEM-SPEC-010","NanoFilt™ Fluoropolymer PTFE 0.1µm 1m²",   "DIV-03","BRD-08","PL-18","SPL-34","MCAT-03","CAT-08","SCAT-17",420,147,"2022-01-01")
+    # Post-acquisition specialty products
+    sku("MEM-SPEC-011","NanoFilt™ ALD-Coated Membrane 0.01µm 1m²","DIV-03","BRD-08","PL-18","SPL-34","MCAT-03","CAT-08","SCAT-17",680,218,"2026-01-01", is_new=True)
+    sku("MEM-SPEC-012","NanoFilt™ Graphene Oxide Membrane 1m²",    "DIV-03","BRD-08","PL-18","SPL-34","MCAT-03","CAT-08","SCAT-17",850,272,"2026-03-01", is_new=True)
 
     return rows
 
 
 # ---------------------------------------------------------------------------
-# dim_version
+# dim_version  (unchanged from v4)
 # ---------------------------------------------------------------------------
 
 def gen_versions():
     rows = [
-        {"version_id":"BUDGET","version_name":"Annual Budget","version_type":"Financial","version_order":1,"lag_months":""},
-        {"version_id":"OP_PLAN","version_name":"Operating Plan","version_type":"Financial","version_order":2,"lag_months":""},
-        {"version_id":"LE1","version_name":"Latest Estimate 1","version_type":"Financial","version_order":3,"lag_months":""},
-        {"version_id":"LE2","version_name":"Latest Estimate 2","version_type":"Financial","version_order":4,"lag_months":""},
-        {"version_id":"LE3","version_name":"Latest Estimate 3","version_type":"Financial","version_order":5,"lag_months":""},
-        {"version_id":"LATEST_EST","version_name":"Latest Estimate","version_type":"Financial","version_order":6,"lag_months":""},
+        {"version_id":"BUDGET",     "version_name":"Annual Budget",      "version_type":"Financial","version_order":1,"lag_months":""},
+        {"version_id":"OP_PLAN",    "version_name":"Operating Plan",     "version_type":"Financial","version_order":2,"lag_months":""},
+        {"version_id":"LE1",        "version_name":"Latest Estimate 1",  "version_type":"Financial","version_order":3,"lag_months":""},
+        {"version_id":"LE2",        "version_name":"Latest Estimate 2",  "version_type":"Financial","version_order":4,"lag_months":""},
+        {"version_id":"LE3",        "version_name":"Latest Estimate 3",  "version_type":"Financial","version_order":5,"lag_months":""},
+        {"version_id":"LATEST_EST", "version_name":"Latest Estimate",    "version_type":"Financial","version_order":6,"lag_months":""},
     ]
     for i in range(1, 11):
         rows.append({
-            "version_id": f"LAG{i}",
+            "version_id":   f"LAG{i}",
             "version_name": f"Lag {i} Forecast",
             "version_type": "ForecastAccuracy",
             "version_order": 6 + i,
-            "lag_months": i,
+            "lag_months":   i,
         })
     return rows
 
 
 # ---------------------------------------------------------------------------
-# dim_promotion
+# dim_promotion  (FSD-appropriate planning events)
 # ---------------------------------------------------------------------------
 
 PROMO_TEMPLATES = [
-    ("Holiday Party Games Feature — Walmart", "Feature",      "KA-01", 11, 12, 0.35, 0.50),
-    ("Back to School WDYM Display — Target",  "Display",      "KA-02",  8,  9, 0.20, 0.35),
-    ("Valentine's Day Let's Get Deep — Amazon","TPR",         "KA-13",  1,  2, 0.15, 0.30),
-    ("Prime Day Games Deal — Amazon 1P",       "TPR",         "KA-13",  7,  7, 0.25, 0.40),
-    ("Super Bowl Buzzed Promo — Retail",       "Feature",     "KA-01",  1,  2, 0.20, 0.35),
-    ("Summer Pool Float Launch — Target & Walmart","Launch",  "KA-02",  5,  6, 0.15, 0.30),
-    ("TikTok Viral Boost — Tower Stack",       "TikTok_Boost","KA-19", None,None,0.40,0.60),
-    ("ESP Holiday Gift Push — Multi-Channel",  "Holiday",     "KA-01", 11, 12, 0.30, 0.45),
-    ("Pop-Tarts Collab Launch",                "Launch",      "KA-02",  9, 10, 0.20, 0.40),
+    # (name_base, type, ka_id, m1, m2, lift_lo, lift_hi)
+    ("INTERPHEX Conference Volume Commitment",   "ConferenceCommitment", "KA-01",  4,  5, 0.12, 0.25),
+    ("BIO International Qualifier Campaign",     "QualificationPush",   "KA-09",  6,  7, 0.15, 0.30),
+    ("Annual Contract Renewal — Pfizer",         "ContractRenewal",      "KA-01",  1,  2, 0.08, 0.20),
+    ("Annual Contract Renewal — Merck",          "ContractRenewal",      "KA-02",  1,  2, 0.08, 0.20),
+    ("Battery OEM Volume Ramp — CATL",           "OEMVolumeRamp",        "KA-16",None,None,0.20,0.45),
+    ("Year-End Inventory Build — Distribution",  "InventoryBuild",       "KA-13", 11, 12, 0.10, 0.22),
+    ("GLP-1 Scale-Up Pull — Large Pharma",       "DemandPull",           "KA-05",  7,  9, 0.18, 0.35),
+    ("Pandemic Surge — Sterile Filtration",      "EmergencyPull",        "KA-14",  3,  6, 0.30, 0.60),
+    ("mRNA Platform Qualification Campaign",     "QualificationPush",    "KA-10",  8,  9, 0.15, 0.30),
 ]
 
 PROMO_SKUS = {
-    "Holiday Party Games Feature — Walmart":     ["WDYM-CORE-001","WDYM-CORE-002","REL-PRTY-001","BUZZ-CORE-001"],
-    "Back to School WDYM Display — Target":      ["WDYM-CORE-001","WDYM-FMLY-001","REL-PRTY-004"],
-    "Valentine's Day Let's Get Deep — Amazon":   ["REL-RLSH-001","REL-PRTY-004","REL-ESP-002"],
-    "Prime Day Games Deal — Amazon 1P":          ["WDYM-CORE-001","BUZZ-CORE-001","REL-PRTY-001","HAK-CORE-001"],
-    "Super Bowl Buzzed Promo — Retail":          ["BUZZ-CORE-001","BUZZ-XPAK-001","BUZZ-SHOT-001"],
-    "Summer Pool Float Launch — Target & Walmart":["REL-OUTD-001","REL-OUTD-002","REL-OUTD-003"],
-    "TikTok Viral Boost — Tower Stack":          ["REL-TSCK-001"],
-    "ESP Holiday Gift Push — Multi-Channel":     ["REL-ESP-001","REL-ESP-002","REL-ESP-003","REL-ESP-011"],
-    "Pop-Tarts Collab Launch":                   ["LIC-PTRT-001","LIC-PTRT-002"],
+    "INTERPHEX Conference Volume Commitment":  ["BPF-DFLT-001","BPF-DFLT-003","BPF-STRL-003","BPF-VIRL-001"],
+    "BIO International Qualifier Campaign":   ["BPF-CHRO-001","BPF-CHRO-008","BPF-VIRL-006","BPF-STRL-001"],
+    "Annual Contract Renewal — Pfizer":       ["BPF-DFLT-001","BPF-STRL-003","BPF-VIRL-002","BPF-CHRO-002"],
+    "Annual Contract Renewal — Merck":        ["BPF-DFLT-003","BPF-STRL-007","BPF-VIRL-003","BPF-CHRO-009"],
+    "Battery OEM Volume Ramp — CATL":         ["MEM-OEMM-001","MEM-OEMM-002","MEM-OEMM-003","MEM-OEMM-004"],
+    "Year-End Inventory Build — Distribution":["HIF-MEDF-001","HIF-MEDF-002","HIF-INDF-003","HIF-INDF-004"],
+    "GLP-1 Scale-Up Pull — Large Pharma":     ["BPF-DFLT-013","BPF-DFLT-014","BPF-STRL-014","BPF-STRL-015"],
+    "Pandemic Surge — Sterile Filtration":    ["BPF-STRL-003","BPF-STRL-004","BPF-STRL-014","BPF-STRL-015","BPF-VIRL-001"],
+    "mRNA Platform Qualification Campaign":   ["BPF-STRL-016","BPF-STRL-017","BPF-VIRL-006","BPF-VIRL-007"],
 }
 
 
@@ -628,23 +698,29 @@ def gen_promotions():
     for year in range(2020, 2027):
         for tmpl in PROMO_TEMPLATES:
             name_base, ptype, ka, m1, m2, lift_lo, lift_hi = tmpl
+            # Pandemic surge only relevant 2020-2021
+            if name_base == "Pandemic Surge — Sterile Filtration" and year > 2021:
+                continue
+            # GLP-1 pull starts 2023
+            if name_base == "GLP-1 Scale-Up Pull — Large Pharma" and year < 2023:
+                continue
             name = f"{name_base} {year}"
             if m1 is None:
-                m1 = random.randint(3, 9)
-                m2 = m1 + random.randint(0, 1)
+                m1 = random.randint(2, 8)
+                m2 = m1 + random.randint(1, 3)
             end_m = min(m2, 12)
             start = date(year, m1, 1)
-            end = date(year, end_m, 28 if end_m == 2 else 30)
-            skus = PROMO_SKUS.get(name_base, ["WDYM-CORE-001"])
+            end   = date(year, end_m, 28 if end_m == 2 else 30)
+            skus  = PROMO_SKUS.get(name_base, ["BPF-DFLT-001"])
             for sku_id in skus:
                 rows.append({
-                    "promotion_id": f"PROMO-{pid:04d}",
-                    "promotion_name": name,
-                    "promotion_type": ptype,
-                    "start_date": start.isoformat(),
-                    "end_date": end.isoformat(),
-                    "sku_id": sku_id,
-                    "key_account_id": ka,
+                    "promotion_id":      f"PROMO-{pid:04d}",
+                    "promotion_name":    name,
+                    "promotion_type":    ptype,
+                    "start_date":        start.isoformat(),
+                    "end_date":          end.isoformat(),
+                    "sku_id":            sku_id,
+                    "key_account_id":    ka,
                     "expected_lift_pct": round(random.uniform(lift_lo, lift_hi), 3),
                 })
                 pid += 1
@@ -656,11 +732,10 @@ def gen_promotions():
 # ---------------------------------------------------------------------------
 
 def build_sku_account_pairs(sku_rows):
-    retail_kas = [ka[0] for ka in KEY_ACCOUNTS if ka[3] == "CHN-01"]
-    ecom_kas   = [ka[0] for ka in KEY_ACCOUNTS if ka[3] == "CHN-02"]
-    dtc_kas    = [ka[0] for ka in KEY_ACCOUNTS if ka[3] == "CHN-03"]
-    tiktok_kas = [ka[0] for ka in KEY_ACCOUNTS if ka[3] == "CHN-04"]
-    dist_kas   = [ka[0] for ka in KEY_ACCOUNTS if ka[3] == "CHN-05"]
+    direct_kas = [ka[0] for ka in KEY_ACCOUNTS if ka[3] == "CHN-01"]
+    dist_kas   = [ka[0] for ka in KEY_ACCOUNTS if ka[3] == "CHN-02"]
+    oem_kas    = [ka[0] for ka in KEY_ACCOUNTS if ka[3] == "CHN-03"]
+    cdmo_kas   = [ka[0] for ka in KEY_ACCOUNTS if ka[3] == "CHN-04"]
 
     pairs = []
     for s in sku_rows:
@@ -668,21 +743,20 @@ def build_sku_account_pairs(sku_rows):
         div = s["division_id"]
         assigned = set()
 
-        if div == "DIV-03":
-            assigned.update(["KA-13", "KA-17"])
-            assigned.update(tiktok_kas)
-            assigned.update(["KA-02", "KA-01"])
+        if div == "DIV-01":
+            # Bioprocessing: direct pharma + CDMOs + distribution
+            assigned.update(direct_kas)
+            assigned.update(cdmo_kas)
+            assigned.update(random.sample(dist_kas, k=2))
         elif div == "DIV-02":
-            assigned.update(random.sample(retail_kas, k=min(6, len(retail_kas))))
-            assigned.update(ecom_kas)
-            assigned.update(dtc_kas)
-            assigned.update(tiktok_kas)
+            # Healthcare & Industrial: distribution-heavy + select direct
+            assigned.update(dist_kas)
+            assigned.update(random.sample(direct_kas, k=random.randint(3, 5)))
         else:
-            assigned.add("KA-01")
-            other_retail = [k for k in retail_kas if k != "KA-01"]
-            assigned.update(random.sample(other_retail, k=random.randint(3, 6)))
-            assigned.update(random.sample(ecom_kas, k=random.randint(2, len(ecom_kas))))
-            assigned.update(dtc_kas[:1])
+            # Membranes / OEM: OEM accounts + select distribution; minimal direct
+            assigned.update(oem_kas)
+            assigned.update(random.sample(dist_kas, k=2))
+            assigned.update(random.sample(direct_kas, k=2))
 
         for ka_id in assigned:
             pairs.append((sid, ka_id))
@@ -691,78 +765,104 @@ def build_sku_account_pairs(sku_rows):
 
 
 # ---------------------------------------------------------------------------
-# Volume & seasonality
+# Demand signals
 # ---------------------------------------------------------------------------
 
+# B2B filtration seasonality: much flatter than CPG.
+# Quarter-end effects, annual budget releases, year-end builds.
 SEASONALITY = {
-    "CAT-01": np.array([0.60,0.55,0.65,0.70,0.75,0.80,0.90,1.00,1.10,1.20,2.50,2.80]),
-    "CAT-02": np.array([0.50,0.45,0.55,0.60,0.70,0.80,0.85,0.90,1.00,1.10,2.80,3.50]),
-    "CAT-03": np.array([0.80,0.75,0.80,0.85,0.90,0.95,0.95,1.00,1.00,1.05,1.80,2.20]),
-    "CAT-04": np.array([0.20,0.20,0.40,0.80,1.60,2.20,2.50,2.20,1.20,0.40,0.30,0.20]),
-    "CAT-05": np.array([1.00,0.90,0.85,0.80,0.85,0.90,0.95,0.95,1.00,1.10,1.80,2.00]),
-    "CAT-06": np.array([0.70,0.80,0.85,0.90,0.90,0.95,1.10,1.00,1.10,1.00,1.50,1.80]),
-    "CAT-07": np.array([1.30,1.10,0.90,0.85,0.85,0.90,0.95,1.00,1.05,1.10,2.20,2.80]),
-    "CAT-08": np.array([1.20,1.00,0.85,0.80,0.80,0.85,0.90,0.95,1.00,1.10,2.50,3.00]),
-    "CAT-09": np.array([1.20,1.10,0.90,0.85,0.85,0.90,0.95,1.00,1.05,1.10,1.80,2.20]),
+    "CAT-01": np.array([1.05,0.90,1.10,1.05,0.95,1.00,0.95,1.00,1.10,1.00,1.05,1.10]),  # depth filtration
+    "CAT-02": np.array([1.10,0.95,1.15,1.05,0.95,1.00,0.95,1.00,1.10,1.00,1.05,1.15]),  # sterile filtration
+    "CAT-03": np.array([1.00,0.90,1.05,1.00,0.95,1.05,1.00,1.00,1.10,1.05,1.00,1.05]),  # viral clearance
+    "CAT-04": np.array([1.05,0.90,1.10,1.00,0.95,1.05,1.00,0.95,1.10,1.00,1.00,1.10]),  # chromatography
+    "CAT-05": np.array([1.05,0.90,1.05,1.00,1.00,1.00,0.95,1.00,1.05,1.00,1.05,1.10]),  # medical device
+    "CAT-06": np.array([1.00,0.90,1.05,1.00,1.00,1.00,1.00,1.00,1.05,1.00,1.00,1.05]),  # industrial
+    # OEM: driven by customer production schedule — quarterly batch ordering
+    "CAT-07": np.array([1.00,1.20,0.90,1.20,0.90,1.10,1.20,0.90,1.10,1.20,0.90,1.10]),  # battery separators
+    "CAT-08": np.array([1.00,1.10,1.00,1.10,1.00,1.00,1.10,1.00,1.00,1.10,1.00,1.00]),  # UPW/semiconductor
+    "CAT-09": np.array([1.00,0.95,1.05,1.00,1.00,1.05,1.00,1.00,1.05,1.00,1.00,1.05]),  # medical OEM
 }
 
 ACCOUNT_BASE = {
-    "KA-01": 5000, "KA-02": 3500, "KA-03": 400,  "KA-04": 350,
-    "KA-05": 600,  "KA-06": 500,  "KA-07": 300,  "KA-08": 250,
-    "KA-09": 200,  "KA-10": 400,  "KA-11": 300,  "KA-12": 350,
-    "KA-13": 2500, "KA-14": 800,  "KA-15": 1200, "KA-16": 900,
-    "KA-17": 600,  "KA-18": 200,  "KA-19": 400,
-    "KA-20": 300,  "KA-21": 250,  "KA-22": 200,
+    "KA-01": 380,  # Pfizer — largest pharma buyer
+    "KA-02": 310,  # Merck
+    "KA-03": 280,  # AstraZeneca
+    "KA-04": 300,  # Roche
+    "KA-05": 260,  # Novo Nordisk (GLP-1 surge driver)
+    "KA-06": 220,  # Lilly (GLP-1 surge driver)
+    "KA-07": 200,  # Sanofi
+    "KA-08": 195,  # BMS
+    "KA-09": 175,  # Biogen
+    "KA-10": 140,  # Moderna
+    "KA-11": 180,  # Amgen
+    "KA-12": 210,  # J&J Biologics
+    "KA-13": 750,  # VWR/Avantor — distribution volume
+    "KA-14": 700,  # Fisher Scientific
+    "KA-15": 580,  # Sigma-Aldrich
+    "KA-16":1100,  # CATL — battery OEM, high volume
+    "KA-17": 850,  # Samsung SDI
+    "KA-18": 480,  # TSMC/UPW
+    "KA-19": 320,  # Lonza CDMO
+    "KA-20": 260,  # Catalent
+    "KA-21": 240,  # Samsung Biologics
+    "KA-22": 185,  # WuXi
 }
 
-YOY_GROWTH = {"DIV-01": 0.09, "DIV-02": 0.22, "DIV-03": 0.0}
+YOY_GROWTH = {
+    "DIV-01": 0.17,  # Bioprocessing: strong pharma/GLP-1/cell-gene demand
+    "DIV-02": 0.06,  # Healthcare & Industrial: stable
+    "DIV-03": 0.28,  # Membranes: EV battery boom + semiconductor expansion
+}
 
-VIRAL_SPIKES = [
-    ("REL-TSCK-001", 2021, 3,  6.0, ["KA-19"]),
-    ("REL-TSCK-001", 2021, 4,  4.0, ["KA-19","KA-13"]),
-    ("REL-TSCK-001", 2021, 5,  2.5, ["KA-19","KA-13","KA-01"]),
-    ("REL-TSCK-001", 2023, 8,  7.0, ["KA-19"]),
-    ("REL-TSCK-001", 2023, 9,  5.0, ["KA-19","KA-13"]),
-    ("REL-TSCK-001", 2023, 10, 3.0, ["KA-19","KA-13","KA-02"]),
-    ("REL-ESP-003",  2022, 5,  4.5, ["KA-19"]),
-    ("REL-ESP-003",  2022, 6,  3.0, ["KA-19","KA-13"]),
-    ("WDYM-CORE-001",2024, 2,  3.5, ["KA-19","KA-13"]),
-    ("REL-PRTY-004", 2024, 9,  4.0, ["KA-19"]),
-    ("REL-PRTY-004", 2024, 10, 3.0, ["KA-19","KA-13"]),
-    ("LIC-CRTR-004", 2023, 4,  5.0, ["KA-19"]),
+# Demand spikes: pandemic surge (sterile filt 2020-2021), GLP-1 ramp (2023+),
+# EV battery ramp (2022+), mRNA platform scale (2021-2022)
+DEMAND_SPIKES = [
+    # (div_id, year, m1, m2, multiplier, ka_ids)
+    ("DIV-01", 2020,  3,  8, 2.2, ["KA-13","KA-14","KA-01","KA-02"]),  # COVID sterile filt
+    ("DIV-01", 2021,  1,  6, 1.6, ["KA-13","KA-14","KA-10"]),           # mRNA vaccine
+    ("DIV-03", 2022,  1, 12, 1.8, ["KA-16","KA-17"]),                   # EV ramp
+    ("DIV-03", 2023,  1, 12, 2.1, ["KA-16","KA-17"]),                   # EV acceleration
+    ("DIV-01", 2023,  6, 12, 1.5, ["KA-05","KA-06","KA-01"]),           # GLP-1 Ozempic/Mounjaro
+    ("DIV-01", 2024,  1, 12, 1.7, ["KA-05","KA-06","KA-01","KA-02"]),   # GLP-1 continued
+    ("DIV-03", 2024,  1, 12, 2.4, ["KA-16","KA-17","KA-18"]),           # semiconductor+EV
 ]
 
 
-def get_spike_mult(sku_id, year, month, ka_id):
-    for sid, yr, mo, mult, channels in VIRAL_SPIKES:
-        if sid == sku_id and yr == year and mo == month and ka_id in channels:
-            return mult
-    return 1.0
+def get_spike_mult(div_id, year, month, ka_id):
+    mult = 1.0
+    for sdiv, yr, m1, m2, m, kas in DEMAND_SPIKES:
+        if sdiv == div_id and yr == year and m1 <= month <= m2 and ka_id in kas:
+            mult = max(mult, m)
+    return mult
 
 
 def sku_volume_scale(sku_id):
-    if sku_id in ("WDYM-CORE-001","WDYM-CORE-002","BUZZ-CORE-001","REL-PRTY-001",
-                   "REL-ESP-001","REL-ESP-002","REL-ESP-003"):
-        return 1.0
-    if sku_id in ("REL-TSCK-001","REL-PRTY-004","REL-RLSH-001","WDYM-FMLY-001"):
-        return 0.80
-    if "XPAK" in sku_id:
-        return 0.30
-    if sku_id.startswith("HUG-CLAS"):
-        return 0.35
-    if sku_id.startswith("HUG-RND"):
-        return 0.25
-    if sku_id.startswith("HUG-BABY"):
-        return 0.15
-    if sku_id.startswith("HUG-BNDL"):
-        return 0.10
-    if sku_id.startswith(("HUG-ACCS","HUG-BERK")):
-        return 0.08
-    if "COZY" in sku_id:
+    """Volume scaling relative to ACCOUNT_BASE (category × format size effect)."""
+    if sku_id.startswith("BPF-DFLT") and "001" <= sku_id[-3:] <= "010":
+        return 0.65  # lenticular sheets — bulk but lower per-account
+    if sku_id.startswith("BPF-DFLT"):
+        return 0.55  # capsules
+    if sku_id.startswith("BPF-STRL"):
+        return 0.80  # sterile filtration — high volume
+    if sku_id.startswith("BPF-CHRO") and "001" <= sku_id[-3:] <= "007":
+        return 0.20  # AEX resins — high value, lower unit count
+    if sku_id.startswith("BPF-CHRO"):
+        return 0.18  # mixed-mode resins
+    if sku_id.startswith("BPF-VIRL"):
+        return 0.12  # viral clearance — very high value, low unit count
+    if sku_id.startswith("HIF-MEDF") and "008" <= sku_id[-3:] <= "009":
+        return 1.20  # bulk packs — higher volume
+    if sku_id.startswith("HIF-MEDF"):
+        return 0.90
+    if sku_id.startswith("HIF-INDF"):
+        return 0.70
+    if sku_id.startswith("MEM-OEMM") and sku_id[8:12] in ("001,","002,","003,","004,"):
+        return 1.50  # battery separators — OEM volume
+    if sku_id.startswith("MEM-OEMM"):
+        return 1.20
+    if sku_id.startswith("MEM-SPEC"):
         return 0.40
-    if "ESP" in sku_id:
-        return 0.55
-    return 0.45
+    return 0.60
 
 
 def base_units(sku_id, ka_id, cat_id, div_id, year, month, sku_info):
@@ -771,74 +871,133 @@ def base_units(sku_id, ka_id, cat_id, div_id, year, month, sku_info):
     if months_since < 0:
         return 0.0
 
-    if div_id == "DIV-01":
-        if months_since == 0:      ramp = 1.8
-        elif months_since <= 2:    ramp = 1.4
-        elif months_since <= 5:    ramp = 1.0
-        elif months_since <= 11:   ramp = 0.75
-        elif sku_volume_scale(sku_id) >= 0.80:
-            ramp = 0.70
-        else:
-            ramp = max(0.35, 0.70 - (months_since - 11) * 0.008)
-    elif div_id == "DIV-02":
-        if months_since == 0:      ramp = 1.5
-        elif months_since <= 3:    ramp = 1.2
-        else:                      ramp = 1.0
-    else:  # DIV-03 Hugimals
-        if months_since < 3:       ramp = 0.6
-        elif months_since < 6:     ramp = 0.85
-        elif months_since < 12:    ramp = 1.0
-        else:                      ramp = 1.2
+    # B2B filtration: no strong lifecycle decay (consumables with repeat orders)
+    if months_since == 0:
+        ramp = 0.40  # initial qualification period, low orders
+    elif months_since <= 3:
+        ramp = 0.65  # qualification + first orders
+    elif months_since <= 8:
+        ramp = 0.88  # ramp toward steady state
+    else:
+        ramp = 1.00  # steady state — consumable, recurring demand
 
-    # Hugimals channel restrictions
+    # OEM/Membrane demand: driven by customer production schedule
     if div_id == "DIV-03":
-        chn = KA_CHANNEL.get(ka_id, "")
-        if chn == "CHN-01" and (year < 2025):
-            return 0.0
-        if chn == "CHN-04" and (year == 2024 and month < 10):
-            return 0.0
+        ka_ch = KA_CHANNEL.get(ka_id, "")
+        if ka_ch not in ("CHN-02", "CHN-03"):
+            ramp *= 0.60  # membranes primarily via OEM + distribution channels
 
-    base = ACCOUNT_BASE.get(ka_id, 200) * sku_volume_scale(sku_id)
+    base   = ACCOUNT_BASE.get(ka_id, 150) * sku_volume_scale(sku_id)
     season = SEASONALITY.get(cat_id, np.ones(12))
-    seas_mult = season[month - 1]
-    growth_mult = (1 + YOY_GROWTH.get(div_id, 0.09)) ** max(0, year - 2020)
-    spike = get_spike_mult(sku_id, year, month, ka_id)
+    seas   = season[month - 1]
+    growth = (1 + YOY_GROWTH.get(div_id, 0.10)) ** max(0, year - 2020)
+    spike  = get_spike_mult(div_id, year, month, ka_id)
 
-    units = base * ramp * seas_mult * growth_mult * spike
-    units *= random.uniform(0.88, 1.12)
+    units  = base * ramp * seas * growth * spike
+    units *= random.uniform(0.90, 1.10)
     return max(0.0, units)
 
 
 # ---------------------------------------------------------------------------
-# fact_financial_plan
+# Data quality score per site  (models ERP migration wave effect)
+# ---------------------------------------------------------------------------
+
+def site_data_quality(site_id: str, period_date: date) -> float:
+    """
+    Pre-cutover: SAP data has missing/delayed records, duplicate GL entries,
+    and no formal SIOP tie-out. Score degrades toward cutover.
+    Post-cutover: JDE data quality visibly improves (real, dateable level shift).
+    This is a teaching example: legitimate level shift vs. timing artifact.
+    """
+    cutover = SITE_CUTOVER[site_id]
+    status  = SITE_STATUS[site_id]
+
+    if status == "live_on_target":
+        base = 0.92 if period_date >= cutover else 0.55
+    elif status == "in_flight":
+        if period_date >= cutover:
+            base = 0.88
+        else:
+            # Degrades in the 3 months before cutover (data freeze prep)
+            days_to_cutover = (cutover - period_date).days
+            if days_to_cutover <= 90:
+                base = max(0.40, 0.62 - (90 - days_to_cutover) * 0.002)
+            else:
+                base = 0.62
+    else:  # legacy
+        base = 0.50
+
+    return round(min(1.0, max(0.20, base + random.uniform(-0.05, 0.05))), 3)
+
+
+# ---------------------------------------------------------------------------
+# WFA-calibrated noise  (54% baseline at LAG1, improving toward 75% by 2026)
+#
+# WFA ≈ 1 - MAPE.  E[|X|] ≈ std * 0.798 for normal distribution.
+# To get WFA=54% (MAPE=46%): std ≈ 0.46/0.798 ≈ 0.576
+# To get WFA=75% (MAPE=25%): std ≈ 0.25/0.798 ≈ 0.313
+# ---------------------------------------------------------------------------
+
+def lag_noise(lag: int, year: int) -> float:
+    """Year-dependent noise standard deviation to model 54%→75% WFA improvement."""
+    # Base noise at LAG1 by year; higher lags add proportional noise
+    lag1_by_year = {2020: 0.56, 2021: 0.54, 2022: 0.51, 2023: 0.48,
+                    2024: 0.45, 2025: 0.38, 2026: 0.32}
+    base = lag1_by_year.get(year, 0.45)
+    # Each additional lag adds ~0.03 noise (less improvement available at longer horizons)
+    return max(0.05, base + (lag - 1) * 0.03)
+
+
+# ---------------------------------------------------------------------------
+# VERSION_NOISE for financial plan versions
 # ---------------------------------------------------------------------------
 
 VERSION_NOISE = {
-    "BUDGET": 0.15, "OP_PLAN": 0.10, "LE1": 0.07,
-    "LE2": 0.04, "LE3": 0.02, "LATEST_EST": 0.01,
+    "BUDGET": 0.22, "OP_PLAN": 0.14, "LE1": 0.09,
+    "LE2": 0.05, "LE3": 0.02, "LATEST_EST": 0.01,
 }
 
-LAG_NOISE = {i: max(0.03, 0.22 - i * 0.02) for i in range(1, 11)}
+
+# ---------------------------------------------------------------------------
+# fact_financial_plan  (adds site_id, data_quality_score, inventory_entitlement_days)
+# ---------------------------------------------------------------------------
+
+# Target DOH by category (inventory entitlement = right amount in right place)
+ENTITLEMENT_DOH = {
+    "CAT-01": 70,  # depth filtration — moderate lead time
+    "CAT-02": 55,  # sterile filtration — shorter lead time, high turns
+    "CAT-03": 80,  # viral clearance — long qualification, safety stock needed
+    "CAT-04": 90,  # chromatography resins — long lead time, critical supply
+    "CAT-05": 45,  # medical device — stable demand, efficient
+    "CAT-06": 50,  # industrial — more predictable
+    "CAT-07": 35,  # battery separators — OEM schedule, JIT preferred
+    "CAT-08": 40,  # UPW membranes
+    "CAT-09": 60,  # medical OEM
+}
 
 
 def gen_fact_financial_plan(sku_rows, pairs):
     sku_map = {s["sku_id"]: s for s in sku_rows}
-    now_ts = "2026-06-16 00:00:00 UTC"
+    now_ts  = "2026-07-02 00:00:00 UTC"
 
     for year in range(2020, 2027):
         rows = []
         print(f"  Generating financial plan {year}...")
         for sku_id, ka_id in pairs:
-            s = sku_map[sku_id]
+            s      = sku_map[sku_id]
             launch = date.fromisoformat(s["launch_date"])
             if launch.year > year:
                 continue
 
             cat_id = s["category_id"]
             div_id = s["division_id"]
-            price = s["unit_price"]
+            price  = s["unit_price"]
+            site   = DIV_PRIMARY_SITE.get(div_id, "SITE-01")
 
-            actuals = {m: base_units(sku_id, ka_id, cat_id, div_id, year, m, s) for m in range(1, 13)}
+            actuals = {m: base_units(sku_id, ka_id, cat_id, div_id, year, m, s)
+                       for m in range(1, 13)}
+
+            entitlement = ENTITLEMENT_DOH.get(cat_id, 60)
 
             for version_id, v_noise in VERSION_NOISE.items():
                 for month in range(1, 13):
@@ -847,20 +1006,25 @@ def gen_fact_financial_plan(sku_rows, pairs):
                         continue
 
                     is_new_launch = (launch.year == year)
-                    bias = 1.20 if (version_id == "BUDGET" and is_new_launch) else (1.05 if version_id == "BUDGET" else 1.0)
+                    bias = 1.18 if (version_id == "BUDGET" and is_new_launch) else \
+                           1.06 if version_id == "BUDGET" else 1.0
 
-                    stat_noise = random.gauss(0, v_noise)
-                    stat_fcst = max(0.0, actual * bias * (1 + stat_noise))
-
+                    stat_fcst = max(0.0, actual * bias * (1 + random.gauss(0, v_noise)))
                     manual_override = 0.0
-                    if random.random() < 0.05 and stat_fcst > 0:
-                        manual_override = round(stat_fcst * random.uniform(-0.15, 0.15), 1)
+                    if random.random() < 0.04 and stat_fcst > 0:
+                        manual_override = round(stat_fcst * random.uniform(-0.12, 0.12), 1)
 
                     total_fcst = max(0.0, stat_fcst + manual_override)
-                    sell_in = round(actual, 1)
-                    sell_thru = round(actual * random.uniform(0.88, 1.05), 1)
-                    inv_on_hand = round(sell_in * random.uniform(0.8, 2.0), 1)
+                    sell_in    = round(actual, 1)
+                    sell_thru  = round(actual * random.uniform(0.90, 1.04), 1)
+
+                    # Actual DOH ~100 days at baseline (FSD inventory position)
+                    actual_doh = round(entitlement * random.uniform(1.1, 1.6), 1)
+                    inv_on_hand = round(sell_in * actual_doh / 30, 1)
                     wos = round(inv_on_hand / max(sell_in / 4, 1), 2)
+
+                    period_date = date(year, month, 1)
+                    dq_score = site_data_quality(site, period_date)
 
                     rows.append({
                         "record_id": str(uuid.uuid4()),
@@ -869,6 +1033,7 @@ def gen_fact_financial_plan(sku_rows, pairs):
                         "fiscal_year": year,
                         "fiscal_month": month,
                         "version_id": version_id,
+                        "site_id": site,
                         "sell_in_units": sell_in,
                         "sell_in_dollars": round(sell_in * price, 2),
                         "sell_through_units": sell_thru,
@@ -881,6 +1046,8 @@ def gen_fact_financial_plan(sku_rows, pairs):
                         "total_forecast_dollars": round(total_fcst * price, 2),
                         "inventory_on_hand_units": inv_on_hand,
                         "weeks_of_supply": wos,
+                        "inventory_entitlement_days": entitlement,
+                        "data_quality_score": dq_score,
                         "loaded_at": now_ts,
                     })
 
@@ -896,8 +1063,8 @@ def gen_fact_financial_plan(sku_rows, pairs):
 
 def gen_fact_pos_weekly(sku_rows, pairs):
     sku_map = {s["sku_id"]: s for s in sku_rows}
-    now_ts = "2026-06-16 00:00:00 UTC"
-    rows = []
+    now_ts  = "2026-07-02 00:00:00 UTC"
+    rows    = []
     print("Generating fact_pos_weekly...")
 
     d = date(2020, 1, 6)
@@ -907,22 +1074,23 @@ def gen_fact_pos_weekly(sku_rows, pairs):
         d += timedelta(weeks=1)
 
     for sku_id, ka_id in pairs:
-        s = sku_map[sku_id]
+        s      = sku_map[sku_id]
         launch = date.fromisoformat(s["launch_date"])
         cat_id = s["category_id"]
         div_id = s["division_id"]
-        price = s["unit_price"]
+        price  = s["unit_price"]
 
         for wk_start in weekly_dates:
             if wk_start < launch:
                 continue
             fy, fq, fm, fw = date_to_fiscal(wk_start)
-            wk_end = wk_start + timedelta(days=6)
+            wk_end    = wk_start + timedelta(days=6)
             is_partial = wk_start.month != wk_end.month
 
-            month_units = base_units(sku_id, ka_id, cat_id, div_id, wk_start.year, wk_start.month, s)
-            pos = round(month_units / 4.3 * random.uniform(0.85, 1.15), 1)
-            inv = round(pos * random.uniform(2.5, 6.0), 1)
+            month_units = base_units(sku_id, ka_id, cat_id, div_id,
+                                     wk_start.year, wk_start.month, s)
+            pos = round(month_units / 4.3 * random.uniform(0.88, 1.12), 1)
+            inv = round(pos * random.uniform(3.0, 7.0), 1)
             wos = round(inv / max(pos, 0.1), 2)
 
             rows.append({
@@ -947,17 +1115,17 @@ def gen_fact_pos_weekly(sku_rows, pairs):
 
 
 # ---------------------------------------------------------------------------
-# fact_forecast_snapshot
+# fact_forecast_snapshot  (noise calibrated for 54%→75% WFA story)
 # ---------------------------------------------------------------------------
 
 def gen_fact_forecast_snapshot(sku_rows, pairs):
     sku_map = {s["sku_id"]: s for s in sku_rows}
-    now_ts = "2026-06-16 00:00:00 UTC"
-    rows = []
+    now_ts  = "2026-07-02 00:00:00 UTC"
+    rows    = []
     print("Generating fact_forecast_snapshot...")
 
     for sku_id, ka_id in pairs:
-        s = sku_map[sku_id]
+        s      = sku_map[sku_id]
         launch = date.fromisoformat(s["launch_date"])
         cat_id = s["category_id"]
         div_id = s["division_id"]
@@ -972,25 +1140,28 @@ def gen_fact_forecast_snapshot(sku_rows, pairs):
 
                 for lag in range(1, 11):
                     snap_month = month - lag
-                    snap_year = year
+                    snap_year  = year
                     while snap_month < 1:
                         snap_month += 12
-                        snap_year -= 1
+                        snap_year  -= 1
                     if snap_year < 2019:
                         continue
 
-                    noise = LAG_NOISE[lag]
+                    noise = lag_noise(lag, year)
                     is_new_launch = (launch.year == year)
+                    # New launches: systematic over-forecast bias
+                    # Demand spikes (COVID/GLP-1/EV): under-forecast bias
+                    spike = get_spike_mult(div_id, year, month, ka_id)
                     if is_new_launch:
-                        bias_factor = 1.20
-                    elif get_spike_mult(sku_id, year, month, ka_id) > 2.0:
-                        bias_factor = 0.45
+                        bias_factor = 1.18
+                    elif spike > 1.5:
+                        bias_factor = 1.0 / spike * 1.2  # miss the spike
                     else:
                         bias_factor = 1.0
 
-                    forecast = max(0.0, actual * bias_factor * (1 + random.gauss(0, noise)))
+                    forecast    = max(0.0, actual * bias_factor * (1 + random.gauss(0, noise)))
                     error_units = round(actual - forecast, 1)
-                    error_pct = round(error_units / max(actual, 1), 4) if actual > 0 else ""
+                    error_pct   = round(error_units / max(actual, 1), 4) if actual > 0 else ""
 
                     rows.append({
                         "record_id": str(uuid.uuid4()),
@@ -1018,67 +1189,86 @@ def gen_fact_forecast_snapshot(sku_rows, pairs):
 # ---------------------------------------------------------------------------
 
 def main():
-    print("=== SIGNAL mock data generator v4 ===")
+    print("=== SIGNAL mock data generator v5 — FSD pivot ===")
 
-    print("\n[1/15] dim_time")
+    print("\n[1/17] dim_time")
     gen_dim_time()
 
-    print("\n[2/15] dim_division")
+    print("\n[2/17] dim_division  (Business Lines)")
     rows = [{"division_id": d[0], "division_name": d[1]} for d in DIVISIONS]
     p = DIM_DIR / "dim_division.csv"; write_csv(p, rows); upload(p)
 
-    print("\n[3/15] dim_brand")
+    print("\n[3/17] dim_brand  (Product Families)")
     rows = [{"brand_id": b[0], "brand_name": b[1], "division_id": b[2]} for b in BRANDS]
     p = DIM_DIR / "dim_brand.csv"; write_csv(p, rows); upload(p)
 
-    print("\n[4/15] dim_product_line")
+    print("\n[4/17] dim_product_line  (Platform / Series)")
     rows = [{"product_line_id": pl[0], "product_line_name": pl[1], "brand_id": pl[2]} for pl in PRODUCT_LINES]
     p = DIM_DIR / "dim_product_line.csv"; write_csv(p, rows); upload(p)
 
-    print("\n[5/15] dim_sub_product_line")
+    print("\n[5/17] dim_sub_product_line  (Fine classification)")
     rows = [{"sub_product_line_id": s[0], "sub_product_line_name": s[1], "product_line_id": s[2]} for s in SUB_PRODUCT_LINES]
     p = DIM_DIR / "dim_sub_product_line.csv"; write_csv(p, rows); upload(p)
 
-    print("\n[6/15] dim_major_category")
+    print("\n[6/17] dim_major_category")
     rows = [{"major_category_id": m[0], "major_category_name": m[1]} for m in MAJOR_CATEGORIES]
     p = DIM_DIR / "dim_major_category.csv"; write_csv(p, rows); upload(p)
 
-    print("\n[7/15] dim_category")
+    print("\n[7/17] dim_category")
     rows = [{"category_id": c[0], "category_name": c[1], "major_category_id": c[2]} for c in CATEGORIES]
     p = DIM_DIR / "dim_category.csv"; write_csv(p, rows); upload(p)
 
-    print("\n[8/15] dim_subcategory")
+    print("\n[8/17] dim_subcategory")
     rows = [{"subcategory_id": s[0], "subcategory_name": s[1], "category_id": s[2]} for s in SUBCATEGORIES]
     p = DIM_DIR / "dim_subcategory.csv"; write_csv(p, rows); upload(p)
 
-    print("\n[9/15] dim_channel_type")
+    print("\n[9/17] dim_channel_type  (PLACEHOLDER — not yet validated vs. FSD CRM)")
     rows = [{"channel_type_id": c[0], "channel_type_name": c[1]} for c in CHANNEL_TYPES]
     p = DIM_DIR / "dim_channel_type.csv"; write_csv(p, rows); upload(p)
 
-    print("\n[10/15] dim_market")
+    print("\n[10/17] dim_market  (End-Markets — PLACEHOLDER)")
     rows = [{"market_id": m[0], "market_name": m[1], "channel_type_id": m[2]} for m in MARKETS]
     p = DIM_DIR / "dim_market.csv"; write_csv(p, rows); upload(p)
 
-    print("\n[11/15] dim_customer_group")
+    print("\n[11/17] dim_customer_group")
     rows = [{"customer_group_id": c[0], "customer_group_name": c[1], "market_id": c[2]} for c in CUSTOMER_GROUPS]
     p = DIM_DIR / "dim_customer_group.csv"; write_csv(p, rows); upload(p)
 
-    print("\n[12/15] dim_key_account")
+    print("\n[12/17] dim_key_account")
     rows = [{"key_account_id": k[0], "key_account_name": k[1], "customer_group_id": k[2], "channel_type_id": k[3]} for k in KEY_ACCOUNTS]
     p = DIM_DIR / "dim_key_account.csv"; write_csv(p, rows); upload(p)
 
-    print("\n[13/15] dim_sku")
+    print("\n[13/17] dim_sku")
     sku_rows = build_skus()
     p = DIM_DIR / "dim_sku.csv"; write_csv(p, sku_rows); upload(p)
     print(f"  Total SKUs: {len(sku_rows)}")
 
-    print("\n[14/15] dim_version")
+    print("\n[14/17] dim_version")
     rows = gen_versions()
     p = DIM_DIR / "dim_version.csv"; write_csv(p, rows); upload(p)
 
-    print("\n[15/15] dim_promotion")
+    print("\n[15/17] dim_promotion")
     rows = gen_promotions()
     p = DIM_DIR / "dim_promotion.csv"; write_csv(p, rows); upload(p)
+
+    print("\n[16/17] dim_site  (Manufacturing sites — 3 real + 2 placeholder)")
+    site_rows = []
+    for s in SITES:
+        site_rows.append({
+            "site_id":                s[0],
+            "site_name":              s[1],
+            "city":                   s[2],
+            "state_or_region":        s[3],
+            "country":                s[4],
+            "business_lines_served":  s[5],
+            "legacy_erp":             s[6],
+            "target_erp":             s[7],
+            "migration_wave":         s[8],
+            "planned_cutover_date":   s[9],
+            "migration_status":       s[10],
+            "is_placeholder_site":    s[11],
+        })
+    p = DIM_DIR / "dim_site.csv"; write_csv(p, site_rows); upload(p)
 
     print("\nBuilding SKU-account pairs...")
     pairs = build_sku_account_pairs(sku_rows)
@@ -1094,9 +1284,9 @@ def main():
     print("\n[FACT] fact_forecast_snapshot...")
     gen_fact_forecast_snapshot(sku_rows, pairs)
 
-    print("\n=== TASK_02 complete ===")
-    hugimals = [s for s in sku_rows if s["is_new_sku"]]
-    print(f"Hugimals SKUs: {len(hugimals)}, Total SKUs: {len(sku_rows)}, Pairs: {len(pairs)}")
+    print("\n=== v5 complete ===")
+    new_skus = [s for s in sku_rows if s["is_new_sku"]]
+    print(f"Post-acquisition new SKUs: {len(new_skus)}, Total SKUs: {len(sku_rows)}, Pairs: {len(pairs)}")
 
 
 if __name__ == "__main__":
