@@ -85,15 +85,15 @@ export function Act4Integration({ filters }: Props) {
   const wfaMin = 0.40;
   const wfaMax = 0.85;
 
-  const skuRiskMap: Record<string, { units: number; accounts: number; dq: number }> = {};
+  const skuRiskMap: Record<string, { units: number; channels: number; dq: number }> = {};
   newSkuRisk.forEach((r: any) => {
-    if (!skuRiskMap[r.sku_id]) skuRiskMap[r.sku_id] = { units: 0, accounts: 0, dq: 0 };
+    if (!skuRiskMap[r.sku_id]) skuRiskMap[r.sku_id] = { units: 0, channels: 0, dq: 0 };
     skuRiskMap[r.sku_id].units    += Number(r.forecast_units) || 0;
-    skuRiskMap[r.sku_id].accounts  = Number(r.account_count) || 0;
+    skuRiskMap[r.sku_id].channels  = Number(r.channel_count) || 0;
     skuRiskMap[r.sku_id].dq        = Number(r.avg_dq_score) || 0;
   });
   const riskySKUs = Object.entries(skuRiskMap)
-    .filter(([, v]) => v.units < 200 || v.accounts < 3)
+    .filter(([, v]) => v.units < 200 || v.channels < 2)
     .slice(0, 9);
 
   return (
@@ -299,11 +299,11 @@ export function Act4Integration({ filters }: Props) {
         </div>
       )}
 
-      {/* Supply risk for new SKUs */}
+      {/* Channel coverage risk for new SKUs (supply/inventory domain is a follow-up) */}
       {riskySKUs.length > 0 && (
         <div className="bg-surface border border-border rounded-xl p-5">
           <h2 className="text-sm font-semibold text-text-primary mb-4">
-            New SKU Supply Risk ({riskySKUs.length})
+            New SKU Channel Coverage Risk ({riskySKUs.length})
           </h2>
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
             {riskySKUs.map(([skuId, v], i) => (
@@ -311,7 +311,7 @@ export function Act4Integration({ filters }: Props) {
                 <div className="text-warning font-medium text-sm mb-2">{skuId}</div>
                 <div className="text-text-secondary text-xs space-y-1">
                   <div>Forecast: {fmt(v.units)} units</div>
-                  <div>Accounts: {v.accounts}</div>
+                  <div>Channels: {v.channels}</div>
                   <div>DQ Score: {v.dq ? (v.dq * 100).toFixed(0) + "%" : "—"}</div>
                   <div className="text-warning mt-2 font-medium">⚠ Run qualification campaign</div>
                 </div>

@@ -7,12 +7,14 @@ import { BarStackChart } from "../components/Charts/BarStackChart";
 
 interface Props { filters: Filters }
 
-const VERSION_COLORS = ["#6366F1", "#10B981", "#F59E0B", "#EF4444", "#8B5CF6", "#94A3B8"];
-const LE_VERSIONS = ["BUDGET", "OP_PLAN", "LE1", "LE2", "LE3", "LATEST_EST"];
+const VERSION_COLORS = ["#94A3B8", "#6366F1", "#10B981", "#F59E0B", "#EF4444", "#8B5CF6"];
+// Derived version labels (from snapshot dates): Budget + a spread of LE cycles.
+// There is no stored version column anywhere — and no LE12.
+const LE_VERSIONS = ["Budget", "LE01", "LE03", "LE06", "LE09", "LE11"];
 
 export function Act3Reconciliation({ filters }: Props) {
   const [reconcData, setReconcData] = useState<any>(null);
-  const [accuracy, setAccuracy] = useState<any[]>([]);
+  const [biasByDiv, setBiasByDiv] = useState<any[]>([]);
   const [lagData, setLagData] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
 
@@ -24,11 +26,11 @@ export function Act3Reconciliation({ filters }: Props) {
 
     Promise.all([
       api.get("/api/reconciliation/summary", { params }),
-      api.get("/api/forecast/accuracy", { params }),
+      api.get("/api/forecast/accuracy-by-division", { params: { fiscal_year: fy } }),
       api.get("/api/forecast/lag-compare", { params: { fiscal_year: fy } }),
     ]).then(([recR, accR, lagR]) => {
       setReconcData(recR.data);
-      setAccuracy(accR.data || []);
+      setBiasByDiv(accR.data || []);
       setLagData(lagR.data || []);
     }).catch(() => {}).finally(() => setLoading(false));
   }, [filters.fiscal_year, filters.division]);
@@ -49,16 +51,16 @@ export function Act3Reconciliation({ filters }: Props) {
     return entry;
   });
 
-  // Lag accuracy bar chart
+  // Lag accuracy bar chart (lag_months derived from snapshot vs target dates)
   const lagChartData = lagData.map((r: any) => ({
-    name: r.lag_label || r.lag_version_id,
-    MAPE: r.avg_mape ? (r.avg_mape * 100).toFixed(1) : 0,
+    name: r.lag_label || `Lag ${r.lag_months}`,
+    MAPE: r.avg_mape ? (Number(r.avg_mape) * 100).toFixed(1) : 0,
   }));
 
-  // Bias analysis by division
-  const biasData = accuracy.map((r: any) => ({
+  // Bias analysis by business line (short-lag mean bias)
+  const biasData = biasByDiv.map((r: any) => ({
     name: r.division_id,
-    "Mean Error": r.mean_error ? (r.mean_error * 100).toFixed(1) : 0,
+    "Mean Bias": r.mean_bias ? (Number(r.mean_bias) * 100).toFixed(1) : 0,
   }));
 
   if (loading) return (
@@ -78,7 +80,8 @@ export function Act3Reconciliation({ filters }: Props) {
       <div className="bg-surface border border-border rounded-xl p-5">
         <h2 className="text-sm font-semibold text-text-primary mb-1">Version Comparison Waterfall</h2>
         <p className="text-text-secondary text-xs mb-4">
-          Budget → OP Plan → LE1 → LE2 → LE3 → Latest Est
+          Budget → LE01 … LE11 (derived from snapshot dates). Each total =
+          YTD actuals + remaining-month forecast.
         </p>
         <WaterfallChart data={waterfall} />
         {waterfall.length > 0 && (
@@ -115,7 +118,8 @@ export function Act3Reconciliation({ filters }: Props) {
         <div className="bg-surface border border-border rounded-xl p-5">
           <h2 className="text-sm font-semibold text-text-primary mb-1">Lag Accuracy (MAPE%)</h2>
           <p className="text-text-secondary text-xs mb-4">
-            Lower is better. Benchmark: 10% (dashed line). LAG1 = 1 month out, LAG10 = 10 months out.
+            Lower is better. Lag 1 = snapshot taken 1 month before the target month,
+            Lag 12 = a full year out (Budget). Lag is derived, never stored.
           </p>
           <BarStackChart
             data={lagChartData}
@@ -128,13 +132,13 @@ export function Act3Reconciliation({ filters }: Props) {
       {/* Bias analysis */}
       {biasData.length > 0 && (
         <div className="bg-surface border border-border rounded-xl p-5">
-          <h2 className="text-sm font-semibold text-text-primary mb-1">Forecast Bias by Division</h2>
+          <h2 className="text-sm font-semibold text-text-primary mb-1">Forecast Bias by Business Line</h2>
           <p className="text-text-secondary text-xs mb-4">
-            Positive = over-forecasting. Negative = under-forecasting.
+            Positive = under-forecasting (actuals above forecast). Negative = over-forecasting.
           </p>
           <BarStackChart
             data={biasData}
-            bars={[{ key: "Mean Error", color: "#F59E0B", label: "Mean Error %" }]}
+            bars={[{ key: "Mean Bias", color: "#F59E0B", label: "Mean Bias %" }]}
             xKey="name"
           />
         </div>

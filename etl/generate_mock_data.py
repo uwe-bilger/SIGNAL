@@ -1,13 +1,23 @@
 """
-SIGNAL mock data generator — v5 (FSD pivot)
+SIGNAL mock data generator — v6 (TASK_09 data model fixes)
 Generates all dimension and fact CSVs for Thermo Fisher's Filtration & Separation Division.
 Uploads to gs://signal-raw-data/raw/
+
+v6 replaces the monolithic fact_financial_plan with six single-purpose fact
+tables (nothing pre-merged, version/lag always derived downstream):
+  1. fact_forecast_sellin_snapshot      SKU × Site × Channel × target_month × snapshot_date
+  2. fact_forecast_sellthrough_snapshot SKU × Channel × target_month × snapshot_date (Dist/OEM only)
+  3. fact_sellin_actuals                SKU × Site × Channel × month
+  4. fact_sellthrough_actuals           SKU × Channel × month (Dist/OEM only)
+  5. fact_financial_snapshot            Division × Channel × Category × target_month × snapshot_date
+  6. fact_financial_actuals             Division × Channel × Category × month
+Plus one ops-domain table (not one of the six): fact_site_data_quality.
+Supply/inventory is explicitly OUT OF SCOPE here — follow-up task.
 """
 
 import csv
 import os
 import random
-import uuid
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -639,27 +649,42 @@ def build_skus():
 
 
 # ---------------------------------------------------------------------------
-# dim_version  (unchanged from v4)
+# Snapshot calendar (TASK_09)
+#
+# One snapshot per month, dated the 3rd Friday of that month. version
+# (Budget / LE01–LE11) and lag_months are NEVER stored columns — they are
+# always derived downstream (BigQuery view / DAX) from snapshot_date vs
+# target_period_date. A stored label can silently drift out of sync with
+# the dates next to it (the LAG1-LAG10 bug this task removes).
+#
+# Cycle rules (FSD planning cadence):
+# - December snapshot sets Budget for all 12 months of the NEXT year.
+# - Jan..Nov snapshots re-forecast the remaining months of the CURRENT
+#   year (derived labels LE01..LE11). December has no LE cycle — by then
+#   only one month of the fiscal year remains (no LE12).
 # ---------------------------------------------------------------------------
 
-def gen_versions():
-    rows = [
-        {"version_id":"BUDGET",     "version_name":"Annual Budget",      "version_type":"Financial","version_order":1,"lag_months":""},
-        {"version_id":"OP_PLAN",    "version_name":"Operating Plan",     "version_type":"Financial","version_order":2,"lag_months":""},
-        {"version_id":"LE1",        "version_name":"Latest Estimate 1",  "version_type":"Financial","version_order":3,"lag_months":""},
-        {"version_id":"LE2",        "version_name":"Latest Estimate 2",  "version_type":"Financial","version_order":4,"lag_months":""},
-        {"version_id":"LE3",        "version_name":"Latest Estimate 3",  "version_type":"Financial","version_order":5,"lag_months":""},
-        {"version_id":"LATEST_EST", "version_name":"Latest Estimate",    "version_type":"Financial","version_order":6,"lag_months":""},
-    ]
-    for i in range(1, 11):
-        rows.append({
-            "version_id":   f"LAG{i}",
-            "version_name": f"Lag {i} Forecast",
-            "version_type": "ForecastAccuracy",
-            "version_order": 6 + i,
-            "lag_months":   i,
-        })
-    return rows
+# Demo "as of" boundary: data ends at the June 2026 planning cycle.
+ACTUALS_THROUGH = date(2026, 6, 30)   # last month with realized actuals
+LAST_SNAPSHOT   = date(2026, 6, 30)   # last snapshot cycle that has run
+
+
+def third_friday(year: int, month: int) -> date:
+    first = date(year, month, 1)
+    offset = (4 - first.weekday()) % 7   # Friday == weekday 4
+    return first + timedelta(days=offset + 14)
+
+
+def snapshots_for_target(year: int, month: int) -> list:
+    """All snapshot dates that forecast target month (year, month)."""
+    snaps = [third_friday(year - 1, 12)]                       # Budget cycle
+    snaps += [third_friday(year, m) for m in range(1, month)]  # LE cycles
+    return [s for s in snaps if date(2019, 12, 1) <= s <= LAST_SNAPSHOT]
+
+
+def lag_between(snapshot: date, target: date) -> int:
+    """Whole months between snapshot month and target month (derived, never stored)."""
+    return (target.year - snapshot.year) * 12 + (target.month - snapshot.month)
 
 
 # ---------------------------------------------------------------------------
@@ -949,239 +974,292 @@ def lag_noise(lag: int, year: int) -> float:
 
 
 # ---------------------------------------------------------------------------
-# VERSION_NOISE for financial plan versions
+# Channel rollup + underlying demand  (TASK_09)
+#
+# Facts are stored at Channel grain (not key account). Key-account detail
+# stays a dimension concern; demand is rolled up over each SKU's assigned
+# accounts per channel type.
 # ---------------------------------------------------------------------------
 
-VERSION_NOISE = {
-    "BUDGET": 0.22, "OP_PLAN": 0.14, "LE1": 0.09,
-    "LE2": 0.05, "LE3": 0.02, "LATEST_EST": 0.01,
-}
+SELLTHROUGH_CHANNELS = ("CHN-02", "CHN-03")   # Distributor, OEM Contract only
 
 
-# ---------------------------------------------------------------------------
-# fact_financial_plan  (adds site_id, data_quality_score, inventory_entitlement_days)
-# ---------------------------------------------------------------------------
-
-# Target DOH by category (inventory entitlement = right amount in right place)
-ENTITLEMENT_DOH = {
-    "CAT-01": 70,  # depth filtration — moderate lead time
-    "CAT-02": 55,  # sterile filtration — shorter lead time, high turns
-    "CAT-03": 80,  # viral clearance — long qualification, safety stock needed
-    "CAT-04": 90,  # chromatography resins — long lead time, critical supply
-    "CAT-05": 45,  # medical device — stable demand, efficient
-    "CAT-06": 50,  # industrial — more predictable
-    "CAT-07": 35,  # battery separators — OEM schedule, JIT preferred
-    "CAT-08": 40,  # UPW membranes
-    "CAT-09": 60,  # medical OEM
-}
-
-
-def gen_fact_financial_plan(sku_rows, pairs):
-    sku_map = {s["sku_id"]: s for s in sku_rows}
-    now_ts  = "2026-07-02 00:00:00 UTC"
-
-    for year in range(2020, 2027):
-        rows = []
-        print(f"  Generating financial plan {year}...")
-        for sku_id, ka_id in pairs:
-            s      = sku_map[sku_id]
-            launch = date.fromisoformat(s["launch_date"])
-            if launch.year > year:
-                continue
-
-            cat_id = s["category_id"]
-            div_id = s["division_id"]
-            price  = s["unit_price"]
-            site   = DIV_PRIMARY_SITE.get(div_id, "SITE-01")
-
-            actuals = {m: base_units(sku_id, ka_id, cat_id, div_id, year, m, s)
-                       for m in range(1, 13)}
-
-            entitlement = ENTITLEMENT_DOH.get(cat_id, 60)
-
-            for version_id, v_noise in VERSION_NOISE.items():
-                for month in range(1, 13):
-                    actual = actuals[month]
-                    if actual == 0:
-                        continue
-
-                    is_new_launch = (launch.year == year)
-                    bias = 1.18 if (version_id == "BUDGET" and is_new_launch) else \
-                           1.06 if version_id == "BUDGET" else 1.0
-
-                    stat_fcst = max(0.0, actual * bias * (1 + random.gauss(0, v_noise)))
-                    manual_override = 0.0
-                    if random.random() < 0.04 and stat_fcst > 0:
-                        manual_override = round(stat_fcst * random.uniform(-0.12, 0.12), 1)
-
-                    total_fcst = max(0.0, stat_fcst + manual_override)
-                    sell_in    = round(actual, 1)
-                    sell_thru  = round(actual * random.uniform(0.90, 1.04), 1)
-
-                    # Actual DOH ~100 days at baseline (FSD inventory position)
-                    actual_doh = round(entitlement * random.uniform(1.1, 1.6), 1)
-                    inv_on_hand = round(sell_in * actual_doh / 30, 1)
-                    wos = round(inv_on_hand / max(sell_in / 4, 1), 2)
-
-                    period_date = date(year, month, 1)
-                    dq_score = site_data_quality(site, period_date)
-
-                    rows.append({
-                        "record_id": str(uuid.uuid4()),
-                        "sku_id": sku_id,
-                        "key_account_id": ka_id,
-                        "fiscal_year": year,
-                        "fiscal_month": month,
-                        "version_id": version_id,
-                        "site_id": site,
-                        "sell_in_units": sell_in,
-                        "sell_in_dollars": round(sell_in * price, 2),
-                        "sell_through_units": sell_thru,
-                        "sell_through_dollars": round(sell_thru * price, 2),
-                        "corrected_history_units": round(actual * random.uniform(0.95, 1.02), 1),
-                        "stat_forecast_units": round(stat_fcst, 1),
-                        "manual_override_units": round(manual_override, 1),
-                        "promo_uplift_units": 0.0,
-                        "total_forecast_units": round(total_fcst, 1),
-                        "total_forecast_dollars": round(total_fcst * price, 2),
-                        "inventory_on_hand_units": inv_on_hand,
-                        "weeks_of_supply": wos,
-                        "inventory_entitlement_days": entitlement,
-                        "data_quality_score": dq_score,
-                        "loaded_at": now_ts,
-                    })
-
-        path = FACT_DIR / f"fact_financial_plan_{year}.csv"
-        write_csv(path, rows)
-        upload(path)
-        yield path
-
-
-# ---------------------------------------------------------------------------
-# fact_pos_weekly
-# ---------------------------------------------------------------------------
-
-def gen_fact_pos_weekly(sku_rows, pairs):
-    sku_map = {s["sku_id"]: s for s in sku_rows}
-    now_ts  = "2026-07-02 00:00:00 UTC"
-    rows    = []
-    print("Generating fact_pos_weekly...")
-
-    d = date(2020, 1, 6)
-    weekly_dates = []
-    while d <= date(2025, 12, 31):
-        weekly_dates.append(d)
-        d += timedelta(weeks=1)
-
+def build_channel_pairs(pairs):
+    """Roll SKU×KA assignments up to SKU×Channel, keeping the KA list."""
+    chan = {}
     for sku_id, ka_id in pairs:
-        s      = sku_map[sku_id]
-        launch = date.fromisoformat(s["launch_date"])
-        cat_id = s["category_id"]
-        div_id = s["division_id"]
-        price  = s["unit_price"]
+        chan.setdefault((sku_id, KA_CHANNEL[ka_id]), []).append(ka_id)
+    return chan
 
-        for wk_start in weekly_dates:
-            if wk_start < launch:
-                continue
-            fy, fq, fm, fw = date_to_fiscal(wk_start)
-            wk_end    = wk_start + timedelta(days=6)
-            is_partial = wk_start.month != wk_end.month
 
-            month_units = base_units(sku_id, ka_id, cat_id, div_id,
-                                     wk_start.year, wk_start.month, s)
-            pos = round(month_units / 4.3 * random.uniform(0.88, 1.12), 1)
-            inv = round(pos * random.uniform(3.0, 7.0), 1)
-            wos = round(inv / max(pos, 0.1), 2)
+def build_demand(sku_rows, chan_pairs):
+    """Underlying monthly sell-in demand: (sku, channel, year, month) -> units.
 
-            rows.append({
-                "record_id": str(uuid.uuid4()),
-                "sku_id": sku_id,
-                "key_account_id": ka_id,
-                "date_id": wk_start.isoformat(),
-                "fiscal_year": fy,
-                "fiscal_week": fw,
-                "is_partial_week": is_partial,
-                "pos_units": pos,
-                "pos_dollars": round(pos * price, 2),
-                "inventory_on_hand_units": inv,
-                "weeks_of_supply": wos,
-                "loaded_at": now_ts,
-            })
+    Generated for the full 2020–2026 horizon. Rows after ACTUALS_THROUGH
+    exist only as the 'truth' that forecasts are noisy versions of — they
+    are never written to the actuals tables.
+    """
+    sku_map = {s["sku_id"]: s for s in sku_rows}
+    demand  = {}
+    for (sku_id, ch), kas in chan_pairs.items():
+        s = sku_map[sku_id]
+        for year in range(2020, 2027):
+            for month in range(1, 13):
+                units = sum(
+                    base_units(sku_id, ka, s["category_id"], s["division_id"],
+                               year, month, s)
+                    for ka in kas
+                )
+                if units > 0:
+                    demand[(sku_id, ch, year, month)] = units
+    return demand
 
-    path = FACT_DIR / "fact_pos_weekly.csv"
+
+def sellthrough_base(demand, sku_id, ch, year, month):
+    """Sell-through lags sell-in via the intermediary's inventory buffer."""
+    prev_y, prev_m = (year - 1, 12) if month == 1 else (year, month - 1)
+    cur  = demand.get((sku_id, ch, year, month), 0.0)
+    prev = demand.get((sku_id, ch, prev_y, prev_m), 0.0)
+    if cur == 0 and prev == 0:
+        return 0.0
+    return 0.55 * cur + 0.45 * prev
+
+
+def channel_spike_mult(div_id, year, month, kas):
+    """Spike multiplier at channel grain = strongest spike among its accounts."""
+    return max(get_spike_mult(div_id, year, month, ka) for ka in kas)
+
+
+def forecast_units_for(actual, lag, year, is_new_launch, spike):
+    """One forecast draw. Noise grows with lag → longer-lag forecasts are
+    systematically less accurate (verification checklist requirement)."""
+    if is_new_launch:
+        bias = 1.18                      # new launches: over-forecast
+    elif spike > 1.5:
+        bias = 1.0 / spike * 1.2         # demand spikes: miss the surge
+    else:
+        bias = 1.0
+    noise = lag_noise(lag, year)
+    return max(0.0, actual * bias * (1 + random.gauss(0, noise)))
+
+
+# ---------------------------------------------------------------------------
+# The six fact tables — nothing pre-merged, no stored version/lag columns.
+# ---------------------------------------------------------------------------
+
+def gen_fact_sellin_actuals(sku_rows, demand):
+    print("Generating fact_sellin_actuals...")
+    sku_map = {s["sku_id"]: s for s in sku_rows}
+    rows = []
+    for (sku_id, ch, year, month), units in sorted(demand.items()):
+        period = date(year, month, 1)
+        if period > ACTUALS_THROUGH:
+            continue
+        rows.append({
+            "sku_id":          sku_id,
+            "site_id":         DIV_PRIMARY_SITE[sku_map[sku_id]["division_id"]],
+            "channel_type_id": ch,
+            "period_date":     period.isoformat(),
+            "actual_units":    round(units, 1),
+        })
+    path = FACT_DIR / "fact_sellin_actuals.csv"
     write_csv(path, rows)
     upload(path)
-    return path
 
 
-# ---------------------------------------------------------------------------
-# fact_forecast_snapshot  (noise calibrated for 54%→75% WFA story)
-# ---------------------------------------------------------------------------
+def gen_fact_sellthrough_actuals(sku_rows, demand, chan_pairs):
+    print("Generating fact_sellthrough_actuals...")
+    rows = []
+    for (sku_id, ch) in sorted(chan_pairs):
+        if ch not in SELLTHROUGH_CHANNELS:
+            continue   # Direct Sales / CDMO have no intermediary layer: no rows
+        for year in range(2020, 2027):
+            for month in range(1, 13):
+                period = date(year, month, 1)
+                if period > ACTUALS_THROUGH:
+                    continue
+                base = sellthrough_base(demand, sku_id, ch, year, month)
+                if base <= 0:
+                    continue
+                rows.append({
+                    "sku_id":          sku_id,
+                    "channel_type_id": ch,
+                    "period_date":     period.isoformat(),
+                    "actual_units":    round(base * random.uniform(0.92, 1.06), 1),
+                })
+    path = FACT_DIR / "fact_sellthrough_actuals.csv"
+    write_csv(path, rows)
+    upload(path)
 
-def gen_fact_forecast_snapshot(sku_rows, pairs):
+
+def gen_fact_forecast_sellin_snapshot(sku_rows, demand, chan_pairs):
+    print("Generating fact_forecast_sellin_snapshot...")
     sku_map = {s["sku_id"]: s for s in sku_rows}
-    now_ts  = "2026-07-02 00:00:00 UTC"
-    rows    = []
-    print("Generating fact_forecast_snapshot...")
-
-    for sku_id, ka_id in pairs:
+    rows = []
+    for (sku_id, ch), kas in sorted(chan_pairs.items()):
         s      = sku_map[sku_id]
         launch = date.fromisoformat(s["launch_date"])
-        cat_id = s["category_id"]
         div_id = s["division_id"]
-
-        for year in range(2020, 2026):
+        site   = DIV_PRIMARY_SITE[div_id]
+        for year in range(2020, 2027):
+            is_new_launch = (launch.year == year)
             for month in range(1, 13):
-                if date(year, month, 1) < launch:
-                    continue
-                actual = base_units(sku_id, ka_id, cat_id, div_id, year, month, s)
+                actual = demand.get((sku_id, ch, year, month), 0.0)
                 if actual == 0:
                     continue
-
-                for lag in range(1, 11):
-                    snap_month = month - lag
-                    snap_year  = year
-                    while snap_month < 1:
-                        snap_month += 12
-                        snap_year  -= 1
-                    if snap_year < 2019:
-                        continue
-
-                    noise = lag_noise(lag, year)
-                    is_new_launch = (launch.year == year)
-                    # New launches: systematic over-forecast bias
-                    # Demand spikes (COVID/GLP-1/EV): under-forecast bias
-                    spike = get_spike_mult(div_id, year, month, ka_id)
-                    if is_new_launch:
-                        bias_factor = 1.18
-                    elif spike > 1.5:
-                        bias_factor = 1.0 / spike * 1.2  # miss the spike
-                    else:
-                        bias_factor = 1.0
-
-                    forecast    = max(0.0, actual * bias_factor * (1 + random.gauss(0, noise)))
-                    error_units = round(actual - forecast, 1)
-                    error_pct   = round(error_units / max(actual, 1), 4) if actual > 0 else ""
-
+                target = date(year, month, 1)
+                spike  = channel_spike_mult(div_id, year, month, kas)
+                for snap in snapshots_for_target(year, month):
+                    lag = lag_between(snap, target)
+                    fcst = forecast_units_for(actual, lag, year, is_new_launch, spike)
                     rows.append({
-                        "record_id": str(uuid.uuid4()),
-                        "sku_id": sku_id,
-                        "key_account_id": ka_id,
-                        "fiscal_year": year,
-                        "fiscal_month": month,
-                        "version_id": f"LAG{lag}",
-                        "snapshot_date": date(snap_year, snap_month, 1).isoformat(),
-                        "forecast_units": round(forecast, 1),
-                        "actual_units": round(actual, 1),
-                        "forecast_error_units": error_units,
-                        "forecast_error_pct": error_pct,
-                        "loaded_at": now_ts,
+                        "sku_id":             sku_id,
+                        "site_id":            site,
+                        "channel_type_id":    ch,
+                        "target_period_date": target.isoformat(),
+                        "snapshot_date":      snap.isoformat(),
+                        "forecast_units":     round(fcst, 1),
                     })
-
-    path = FACT_DIR / "fact_forecast_snapshot.csv"
+    path = FACT_DIR / "fact_forecast_sellin_snapshot.csv"
     write_csv(path, rows)
     upload(path)
-    return path
+
+
+def gen_fact_forecast_sellthrough_snapshot(sku_rows, demand, chan_pairs):
+    print("Generating fact_forecast_sellthrough_snapshot...")
+    sku_map = {s["sku_id"]: s for s in sku_rows}
+    rows = []
+    for (sku_id, ch), kas in sorted(chan_pairs.items()):
+        if ch not in SELLTHROUGH_CHANNELS:
+            continue
+        s      = sku_map[sku_id]
+        launch = date.fromisoformat(s["launch_date"])
+        div_id = s["division_id"]
+        for year in range(2020, 2027):
+            is_new_launch = (launch.year == year)
+            for month in range(1, 13):
+                base = sellthrough_base(demand, sku_id, ch, year, month)
+                if base <= 0:
+                    continue
+                target = date(year, month, 1)
+                spike  = channel_spike_mult(div_id, year, month, kas)
+                for snap in snapshots_for_target(year, month):
+                    # Sell-through visibility is worse than sell-in: the
+                    # intermediary's reporting adds noise on top of lag noise.
+                    lag  = lag_between(snap, target)
+                    fcst = forecast_units_for(base, lag, year, is_new_launch, spike)
+                    fcst *= random.uniform(0.97, 1.03)
+                    rows.append({
+                        "sku_id":             sku_id,
+                        "channel_type_id":    ch,
+                        "target_period_date": target.isoformat(),
+                        "snapshot_date":      snap.isoformat(),
+                        "forecast_units":     round(fcst, 1),
+                    })
+    path = FACT_DIR / "fact_forecast_sellthrough_snapshot.csv"
+    write_csv(path, rows)
+    upload(path)
+
+
+# ---------------------------------------------------------------------------
+# Financial tables — finance's own coarser grain (Division × Channel ×
+# Category). No SKU, no units, anywhere. Dollars only.
+# ---------------------------------------------------------------------------
+
+def build_financial(sku_rows, demand):
+    """Aggregate underlying demand to finance grain: (div, ch, cat, y, m) -> [rev, cost]."""
+    sku_map = {s["sku_id"]: s for s in sku_rows}
+    fin = {}
+    for (sku_id, ch, year, month), units in demand.items():
+        s = sku_map[sku_id]
+        key = (s["division_id"], ch, s["category_id"], year, month)
+        acc = fin.setdefault(key, [0.0, 0.0])
+        acc[0] += units * s["unit_price"]
+        acc[1] += units * s["unit_cost"]
+    return fin
+
+
+def fin_noise(lag: int) -> float:
+    """Financial plan noise by lag — coarser grain, lower relative noise than
+    SKU-level demand, but still monotonically worse at longer horizons."""
+    return 0.03 + 0.012 * lag
+
+
+def gen_fact_financial_actuals(fin):
+    print("Generating fact_financial_actuals...")
+    rows = []
+    for (div, ch, cat, year, month), (rev, cost) in sorted(fin.items()):
+        period = date(year, month, 1)
+        if period > ACTUALS_THROUGH:
+            continue
+        # Small GL-level adjustments: financial actuals never tie perfectly
+        # to demand units × list price (rebates, accruals, FX).
+        rev_a  = round(rev  * random.uniform(0.97, 1.01), 2)
+        cost_a = round(cost * random.uniform(0.98, 1.02), 2)
+        rows.append({
+            "division_id":     div,
+            "channel_type_id": ch,
+            "category_id":     cat,
+            "period_date":     period.isoformat(),
+            "revenue":         rev_a,
+            "cost":            cost_a,
+            "margin":          round(rev_a - cost_a, 2),
+        })
+    path = FACT_DIR / "fact_financial_actuals.csv"
+    write_csv(path, rows)
+    upload(path)
+
+
+def gen_fact_financial_snapshot(fin):
+    print("Generating fact_financial_snapshot...")
+    rows = []
+    for (div, ch, cat, year, month), (rev, cost) in sorted(fin.items()):
+        target = date(year, month, 1)
+        for snap in snapshots_for_target(year, month):
+            lag   = lag_between(snap, target)
+            noise = fin_noise(lag)
+            # Budget cycle (December snapshot) carries planning optimism.
+            optimism = 1.06 if snap.month == 12 else 1.0
+            rev_f  = round(max(0.0, rev  * optimism * (1 + random.gauss(0, noise))), 2)
+            cost_f = round(max(0.0, cost * optimism * (1 + random.gauss(0, noise * 0.85))), 2)
+            rows.append({
+                "division_id":        div,
+                "channel_type_id":    ch,
+                "category_id":        cat,
+                "target_period_date": target.isoformat(),
+                "snapshot_date":      snap.isoformat(),
+                "revenue":            rev_f,
+                "cost":               cost_f,
+                "margin":             round(rev_f - cost_f, 2),
+            })
+    path = FACT_DIR / "fact_financial_snapshot.csv"
+    write_csv(path, rows)
+    upload(path)
+
+
+# ---------------------------------------------------------------------------
+# fact_site_data_quality — ops domain, NOT one of the six demand/financial
+# tables. Keeps the Act-4 ERP-migration story alive after data_quality_score
+# was removed from the fact tables (they carry exactly their spec'd fields).
+# ---------------------------------------------------------------------------
+
+def gen_fact_site_data_quality():
+    print("Generating fact_site_data_quality...")
+    rows = []
+    for site_id, *_ in SITES:
+        for year in range(2020, 2027):
+            for month in range(1, 13):
+                period = date(year, month, 1)
+                if period > ACTUALS_THROUGH:
+                    continue
+                rows.append({
+                    "site_id":            site_id,
+                    "period_date":        period.isoformat(),
+                    "data_quality_score": site_data_quality(site_id, period),
+                })
+    path = FACT_DIR / "fact_site_data_quality.csv"
+    write_csv(path, rows)
+    upload(path)
 
 
 # ---------------------------------------------------------------------------
@@ -1189,69 +1267,69 @@ def gen_fact_forecast_snapshot(sku_rows, pairs):
 # ---------------------------------------------------------------------------
 
 def main():
-    print("=== SIGNAL mock data generator v5 — FSD pivot ===")
+    print("=== SIGNAL mock data generator v6 — TASK_09 data model fixes ===")
 
-    print("\n[1/17] dim_time")
+    print("\n[1/16] dim_time")
     gen_dim_time()
 
-    print("\n[2/17] dim_division  (Business Lines)")
+    print("\n[2/16] dim_division  (Business Lines)")
     rows = [{"division_id": d[0], "division_name": d[1]} for d in DIVISIONS]
     p = DIM_DIR / "dim_division.csv"; write_csv(p, rows); upload(p)
 
-    print("\n[3/17] dim_brand  (Product Families)")
+    print("\n[3/16] dim_brand  (Product Families)")
     rows = [{"brand_id": b[0], "brand_name": b[1], "division_id": b[2]} for b in BRANDS]
     p = DIM_DIR / "dim_brand.csv"; write_csv(p, rows); upload(p)
 
-    print("\n[4/17] dim_product_line  (Platform / Series)")
+    print("\n[4/16] dim_product_line  (Platform / Series)")
     rows = [{"product_line_id": pl[0], "product_line_name": pl[1], "brand_id": pl[2]} for pl in PRODUCT_LINES]
     p = DIM_DIR / "dim_product_line.csv"; write_csv(p, rows); upload(p)
 
-    print("\n[5/17] dim_sub_product_line  (Fine classification)")
+    print("\n[5/16] dim_sub_product_line  (Fine classification)")
     rows = [{"sub_product_line_id": s[0], "sub_product_line_name": s[1], "product_line_id": s[2]} for s in SUB_PRODUCT_LINES]
     p = DIM_DIR / "dim_sub_product_line.csv"; write_csv(p, rows); upload(p)
 
-    print("\n[6/17] dim_major_category")
+    print("\n[6/16] dim_major_category")
     rows = [{"major_category_id": m[0], "major_category_name": m[1]} for m in MAJOR_CATEGORIES]
     p = DIM_DIR / "dim_major_category.csv"; write_csv(p, rows); upload(p)
 
-    print("\n[7/17] dim_category")
+    print("\n[7/16] dim_category")
     rows = [{"category_id": c[0], "category_name": c[1], "major_category_id": c[2]} for c in CATEGORIES]
     p = DIM_DIR / "dim_category.csv"; write_csv(p, rows); upload(p)
 
-    print("\n[8/17] dim_subcategory")
+    print("\n[8/16] dim_subcategory")
     rows = [{"subcategory_id": s[0], "subcategory_name": s[1], "category_id": s[2]} for s in SUBCATEGORIES]
     p = DIM_DIR / "dim_subcategory.csv"; write_csv(p, rows); upload(p)
 
-    print("\n[9/17] dim_channel_type  (PLACEHOLDER — not yet validated vs. FSD CRM)")
+    print("\n[9/16] dim_channel_type  (PLACEHOLDER — not yet validated vs. FSD CRM)")
     rows = [{"channel_type_id": c[0], "channel_type_name": c[1]} for c in CHANNEL_TYPES]
     p = DIM_DIR / "dim_channel_type.csv"; write_csv(p, rows); upload(p)
 
-    print("\n[10/17] dim_market  (End-Markets — PLACEHOLDER)")
+    print("\n[10/16] dim_market  (End-Markets — PLACEHOLDER)")
     rows = [{"market_id": m[0], "market_name": m[1], "channel_type_id": m[2]} for m in MARKETS]
     p = DIM_DIR / "dim_market.csv"; write_csv(p, rows); upload(p)
 
-    print("\n[11/17] dim_customer_group")
+    print("\n[11/16] dim_customer_group")
     rows = [{"customer_group_id": c[0], "customer_group_name": c[1], "market_id": c[2]} for c in CUSTOMER_GROUPS]
     p = DIM_DIR / "dim_customer_group.csv"; write_csv(p, rows); upload(p)
 
-    print("\n[12/17] dim_key_account")
+    print("\n[12/16] dim_key_account")
     rows = [{"key_account_id": k[0], "key_account_name": k[1], "customer_group_id": k[2], "channel_type_id": k[3]} for k in KEY_ACCOUNTS]
     p = DIM_DIR / "dim_key_account.csv"; write_csv(p, rows); upload(p)
 
-    print("\n[13/17] dim_sku")
+    print("\n[13/16] dim_sku")
     sku_rows = build_skus()
     p = DIM_DIR / "dim_sku.csv"; write_csv(p, sku_rows); upload(p)
     print(f"  Total SKUs: {len(sku_rows)}")
 
-    print("\n[14/17] dim_version")
-    rows = gen_versions()
-    p = DIM_DIR / "dim_version.csv"; write_csv(p, rows); upload(p)
+    # dim_version is intentionally GONE in v6 (TASK_09): version labels
+    # (Budget/LE01-LE11) and lag_months are derived from snapshot_date vs
+    # target_period_date in views/DAX, never stored.
 
-    print("\n[15/17] dim_promotion")
+    print("\n[14/16] dim_promotion")
     rows = gen_promotions()
     p = DIM_DIR / "dim_promotion.csv"; write_csv(p, rows); upload(p)
 
-    print("\n[16/17] dim_site  (Manufacturing sites — 3 real + 2 placeholder)")
+    print("\n[15/16] dim_site  (Manufacturing sites — 3 real + 2 placeholder)")
     site_rows = []
     for s in SITES:
         site_rows.append({
@@ -1270,23 +1348,37 @@ def main():
         })
     p = DIM_DIR / "dim_site.csv"; write_csv(p, site_rows); upload(p)
 
-    print("\nBuilding SKU-account pairs...")
-    pairs = build_sku_account_pairs(sku_rows)
-    print(f"  Total pairs: {len(pairs)}")
+    print("\n[16/16] SKU-account pairs -> channel rollup -> underlying demand")
+    pairs      = build_sku_account_pairs(sku_rows)
+    chan_pairs = build_channel_pairs(pairs)
+    demand     = build_demand(sku_rows, chan_pairs)
+    print(f"  KA pairs: {len(pairs)} | SKU-channel combos: {len(chan_pairs)} | demand cells: {len(demand)}")
 
-    print("\n[FACT] fact_financial_plan (2020-2026)...")
-    for _ in gen_fact_financial_plan(sku_rows, pairs):
-        pass
+    print("\n[FACT 1/6] fact_forecast_sellin_snapshot")
+    gen_fact_forecast_sellin_snapshot(sku_rows, demand, chan_pairs)
 
-    print("\n[FACT] fact_pos_weekly...")
-    gen_fact_pos_weekly(sku_rows, pairs)
+    print("\n[FACT 2/6] fact_forecast_sellthrough_snapshot  (Distributor/OEM only)")
+    gen_fact_forecast_sellthrough_snapshot(sku_rows, demand, chan_pairs)
 
-    print("\n[FACT] fact_forecast_snapshot...")
-    gen_fact_forecast_snapshot(sku_rows, pairs)
+    print("\n[FACT 3/6] fact_sellin_actuals")
+    gen_fact_sellin_actuals(sku_rows, demand)
 
-    print("\n=== v5 complete ===")
+    print("\n[FACT 4/6] fact_sellthrough_actuals  (Distributor/OEM only)")
+    gen_fact_sellthrough_actuals(sku_rows, demand, chan_pairs)
+
+    print("\n[FACT 5/6 + 6/6] financial snapshot + actuals  (Division × Channel × Category, dollars only)")
+    fin = build_financial(sku_rows, demand)
+    gen_fact_financial_snapshot(fin)
+    gen_fact_financial_actuals(fin)
+
+    print("\n[OPS] fact_site_data_quality  (ERP migration story — not one of the six)")
+    gen_fact_site_data_quality()
+
+    print("\n=== v6 complete ===")
     new_skus = [s for s in sku_rows if s["is_new_sku"]]
-    print(f"Post-acquisition new SKUs: {len(new_skus)}, Total SKUs: {len(sku_rows)}, Pairs: {len(pairs)}")
+    print(f"Post-acquisition new SKUs: {len(new_skus)}, Total SKUs: {len(sku_rows)}, "
+          f"SKU-channel combos: {len(chan_pairs)}")
+    print("NOTE: supply/inventory facts intentionally NOT generated — separate follow-up task.")
 
 
 if __name__ == "__main__":

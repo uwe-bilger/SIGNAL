@@ -6,11 +6,27 @@ short — this file's only job is to exist, not to be smart.
 
 ## Now
 
-Connect Power BI Desktop to BigQuery `signal_dw` (native connector) and
-explore the data as it currently stands — no build work yet, just
-connecting and looking around to get a feel for the shape of it.
+TASK_09 landed: `signal_dw` is now the six-table model —
+`fact_forecast_sellin_snapshot`, `fact_forecast_sellthrough_snapshot`,
+`fact_sellin_actuals`, `fact_sellthrough_actuals`,
+`fact_financial_snapshot`, `fact_financial_actuals` (+
+`fact_site_data_quality` as a small ops-domain table for the Act 4 ERP
+story). Nothing pre-merged; snapshots dated the 3rd Friday of each month;
+`version` (Budget/LE01–LE11) and `lag_months` exist only as derived
+columns in views (`v_forecast_sellin`, `v_forecast_accuracy`, …) —
+`dim_version` and the LAG1–LAG10 labels are gone.
+
+Reconnect Power BI Desktop to the new tables/views and rebuild the model
+view on shared dimensions + derived-version DAX measures (WFA, bias,
+MAPE-by-lag driven by a Measurement Month slicer).
 
 ## Next
+
+- **Supply/inventory fact table(s)** — explicitly left out of TASK_09
+  (grain/structure not yet designed). Own domain, own task; do not fold
+  into the six demand/financial tables. The old
+  `weeks_of_supply`/`inventory_on_hand`/entitlement fields died with
+  `fact_financial_plan` and are waiting on this follow-up.
 
 - **The React/Cloudflare web visualization is paused, not abandoned.**
   It was the right call for Relatable specifically (non-Microsoft shop,

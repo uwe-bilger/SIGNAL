@@ -15,6 +15,10 @@ def integration_overview():
     2. Per-site ERP migration wave: each site transitions from legacy SAP to
        Oracle JDE on its planned cutover date, creating a visible, dateable
        data-quality step change.
+
+    TASK_09: data quality now lives in its own ops table
+    (fact_site_data_quality) — the demand/financial fact tables carry exactly
+    their spec'd fields and nothing else.
     """
 
     # ERP migration status by site
@@ -29,35 +33,35 @@ def integration_overview():
         ORDER BY migration_wave, site_id
     """)
 
-    # Data quality trend by site — monthly average score over the last 24 months
+    # Data quality trend by site — monthly score over the last ~2.5 years
     dq_trend = run_query(f"""
         SELECT
-            f.site_id,
-            f.fiscal_year,
-            f.fiscal_month,
-            AVG(CAST(f.data_quality_score AS FLOAT64)) AS avg_data_quality,
-            COUNT(*) AS record_count
-        FROM {q('fact_financial_plan')} f
-        WHERE f.version_id = 'LATEST_EST'
-          AND f.fiscal_year >= 2024
+            dq.site_id,
+            EXTRACT(YEAR  FROM dq.period_date) AS fiscal_year,
+            EXTRACT(MONTH FROM dq.period_date) AS fiscal_month,
+            AVG(dq.data_quality_score) AS avg_data_quality,
+            COUNT(*)                   AS record_count
+        FROM {q('fact_site_data_quality')} dq
+        WHERE EXTRACT(YEAR FROM dq.period_date) >= 2024
         GROUP BY 1, 2, 3
         ORDER BY 1, 2, 3
     """)
 
-    # Pre-acquisition vs post-acquisition summary
+    # Pre- vs post-acquisition summary — actuals joined to dim_time and
+    # dim_sku (for dollars) at QUERY TIME; nothing pre-merged at rest.
     acquisition_summary = run_query(f"""
         SELECT
             t.is_pre_acquisition,
             s.division_id,
-            COUNT(DISTINCT f.sku_id)         AS sku_count,
-            SUM(f.sell_in_units)             AS total_units,
-            SUM(f.sell_in_dollars)           AS total_dollars,
-            AVG(CAST(f.data_quality_score AS FLOAT64)) AS avg_data_quality
-        FROM {q('fact_financial_plan')} f
-        JOIN {q('dim_time')} t
-          ON CAST(t.date_id AS DATE) = DATE(f.fiscal_year, f.fiscal_month, 1)
-        JOIN {q('dim_sku')} s ON f.sku_id = s.sku_id
-        WHERE f.version_id = 'LATEST_EST'
+            COUNT(DISTINCT a.sku_id)                              AS sku_count,
+            SUM(a.actual_units)                                   AS total_units,
+            SUM(a.actual_units * CAST(s.unit_price AS FLOAT64))   AS total_dollars,
+            AVG(dq.data_quality_score)                            AS avg_data_quality
+        FROM {q('fact_sellin_actuals')} a
+        JOIN {q('dim_time')} t ON CAST(t.date_id AS DATE) = a.period_date
+        JOIN {q('dim_sku')}  s ON a.sku_id = s.sku_id
+        LEFT JOIN {q('fact_site_data_quality')} dq
+          ON dq.site_id = a.site_id AND dq.period_date = a.period_date
         GROUP BY 1, 2
         ORDER BY 1, 2
     """)
@@ -72,38 +76,37 @@ def integration_overview():
         ORDER BY s.launch_date, s.sku_id
     """)
 
-    # WFA trend (derived from forecast snapshot — 1 - MAPE at LAG1)
+    # WFA trend — 1 - MAPE at lag 1, lag DERIVED in the accuracy view
     wfa_trend = run_query(f"""
         SELECT
-            fs.fiscal_year,
-            fs.fiscal_month,
+            fa.fiscal_year,
+            fa.fiscal_month,
             s.division_id,
-            COUNT(*) AS snapshots,
-            AVG(ABS(SAFE_CAST(fs.forecast_error_pct AS FLOAT64))) AS mape,
-            1 - AVG(ABS(SAFE_CAST(fs.forecast_error_pct AS FLOAT64))) AS wfa_estimate
-        FROM {q('fact_forecast_snapshot')} fs
-        JOIN {q('dim_sku')} s ON fs.sku_id = s.sku_id
-        WHERE fs.version_id = 'LAG1'
-          AND SAFE_CAST(fs.forecast_error_pct AS FLOAT64) IS NOT NULL
-          AND fs.actual_units > 0
+            COUNT(*)                   AS snapshots,
+            AVG(ABS(fa.error_pct))     AS mape,
+            1 - AVG(ABS(fa.error_pct)) AS wfa_estimate
+        FROM {q('v_forecast_accuracy')} fa
+        JOIN {q('dim_sku')} s USING (sku_id)
+        WHERE fa.lag_months = 1
         GROUP BY 1, 2, 3
         ORDER BY 1, 2, 3
     """)
 
-    # Supply risk for new SKUs (low forecast coverage = channel gap)
+    # Channel coverage risk for new SKUs (few channels = qualification gap)
     new_sku_risk = run_query(f"""
         SELECT
             f.sku_id,
             s.sku_name,
             f.fiscal_year,
             f.fiscal_month,
-            SUM(f.total_forecast_units)    AS forecast_units,
-            COUNT(DISTINCT f.key_account_id) AS account_count,
-            AVG(CAST(f.data_quality_score AS FLOAT64)) AS avg_dq_score
-        FROM {q('fact_financial_plan')} f
-        JOIN {q('dim_sku')} s ON f.sku_id = s.sku_id
+            SUM(f.forecast_units)               AS forecast_units,
+            COUNT(DISTINCT f.channel_type_id)   AS channel_count,
+            AVG(dq.data_quality_score)          AS avg_dq_score
+        FROM {q('v_forecast_sellin')} f
+        JOIN {q('dim_sku')} s USING (sku_id)
+        LEFT JOIN {q('fact_site_data_quality')} dq
+          ON dq.site_id = f.site_id AND dq.period_date = f.target_period_date
         WHERE s.is_new_sku = 'True'
-          AND f.version_id = 'LATEST_EST'
           AND f.fiscal_year = 2026
         GROUP BY 1, 2, 3, 4
         ORDER BY f.fiscal_month, f.sku_id

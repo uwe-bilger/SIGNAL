@@ -4,33 +4,35 @@ from db.bigquery_client import run_query, q
 
 router = APIRouter(prefix="/api/exceptions", tags=["exceptions"])
 
+# TASK_09: exception flags come from v_exception_flags — short-lag forecast
+# accuracy (bias / MAPE), derived at query time from the forecast-vs-actuals
+# join. The old stock-risk / weeks-of-supply flags are GONE: supply/inventory
+# is out of scope for this model and returns in its own follow-up task.
+
 
 @router.get("")
 def get_exceptions(
-    fiscal_year:   int,
-    fiscal_month:  Optional[int] = None,
-    division:      Optional[str] = None,
+    fiscal_year: int,
+    division:    Optional[str] = None,
 ):
-    parts = [f"f.fiscal_year = {fiscal_year}"]
-    if fiscal_month: parts.append(f"f.fiscal_month = {fiscal_month}")
-    if division:     parts.append(f"s.division_id = '{division}'")
-    where = "WHERE " + " AND ".join(parts)
+    div_filter = f"AND e.division_id = '{division}'" if division else ""
     sql = f"""
         SELECT
-            f.sku_id, s.sku_name, s.division_id, f.fiscal_year, f.fiscal_month,
-            s.is_new_sku,
-            MAX(CASE WHEN f.weeks_of_supply < 4 THEN 1 ELSE 0 END)  AS stock_risk_flag,
-            MAX(CASE WHEN ABS(f.total_forecast_units - f.stat_forecast_units)
-                          / NULLIF(f.stat_forecast_units, 0) > 0.10 THEN 1 ELSE 0 END) AS override_flag,
-            AVG(f.weeks_of_supply) AS avg_wos,
-            SUM(f.total_forecast_units) AS total_forecast_units
-        FROM {q('fact_financial_plan')} f
-        JOIN {q('dim_sku')} s ON f.sku_id = s.sku_id
-        {where}
-          AND f.version_id = 'LATEST_EST'
-        GROUP BY 1,2,3,4,5,6
-        HAVING stock_risk_flag = 1 OR override_flag = 1 OR s.is_new_sku = 'True'
-        ORDER BY stock_risk_flag DESC, override_flag DESC
+            e.sku_id,
+            e.sku_name,
+            e.division_id,
+            e.is_new_sku,
+            e.fiscal_year,
+            e.mean_bias,
+            e.mape,
+            e.bias_flag,
+            e.accuracy_flag,
+            e.new_sku_flag
+        FROM {q('v_exception_flags')} e
+        WHERE e.fiscal_year = {int(fiscal_year)}
+          {div_filter}
+          AND (e.bias_flag = 1 OR e.accuracy_flag = 1 OR e.new_sku_flag = 1)
+        ORDER BY e.accuracy_flag DESC, ABS(e.mean_bias) DESC
         LIMIT 500
     """
     return run_query(sql)

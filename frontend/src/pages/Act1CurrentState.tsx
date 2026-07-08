@@ -53,15 +53,16 @@ export function Act1CurrentState({ filters }: Props) {
   useEffect(() => {
     setLoading(true);
     const fy = filters.fiscal_year || 2024;
-    const v = filters.version_id || "LATEST_EST";
-    const params: any = { fiscal_year: fy, version_id: v };
+    // No version_id -> API returns the latest available snapshot per month
+    const params: any = { fiscal_year: fy };
+    if (filters.version_id) params.version_id = filters.version_id;
     if (filters.division) params.division = filters.division;
     if (filters.channel_type) params.channel_type = filters.channel_type;
 
     Promise.all([
       api.get("/api/plan/summary", { params }),
       api.get("/api/plan/summary", { params: { ...params, fiscal_year: fy - 1 } }),
-      api.get("/api/plan/summary", { params: { ...params, version_id: "BUDGET" } }),
+      api.get("/api/plan/summary", { params: { ...params, version_id: "Budget" } }),
       api.get("/api/plan/top-skus", { params: { ...params, limit: 15 } }),
       api.get("/api/exceptions", { params: { fiscal_year: fy, division: filters.division } }),
     ]).then(([curR, pyR, budR, skuR, excR]) => {
@@ -108,11 +109,11 @@ export function Act1CurrentState({ filters }: Props) {
     .sort((a, b) => b[1] - a[1])
     .slice(0, 15)
     .map(([id]) => id);
-  const accounts = Array.from(new Set(skuMatrix.map((r: any) => r.key_account_id))).slice(0, 8) as string[];
+  const channels = Array.from(new Set(skuMatrix.map((r: any) => r.channel_type_id))).slice(0, 8) as string[];
   const heatData: Record<string, Record<string, number>> = {};
   skuMatrix.forEach((r: any) => {
     if (!heatData[r.sku_id]) heatData[r.sku_id] = {};
-    heatData[r.sku_id][r.key_account_id] = (heatData[r.sku_id][r.key_account_id] || 0) + Number(r.forecast_units);
+    heatData[r.sku_id][r.channel_type_id] = (heatData[r.sku_id][r.channel_type_id] || 0) + Number(r.forecast_units);
   });
 
   // Top 10 SKUs bar
@@ -121,7 +122,7 @@ export function Act1CurrentState({ filters }: Props) {
     .slice(0, 10)
     .map(([sku, units]) => ({ name: sku.length > 14 ? sku.slice(0, 14) : sku, units }));
 
-  const flagged = exceptions.filter((e: any) => e.stock_risk_flag || e.override_flag);
+  const flagged = exceptions.filter((e: any) => e.accuracy_flag || e.bias_flag);
 
   if (loading) return (
     <div className="flex items-center justify-center h-64 text-text-secondary">Loading...</div>
@@ -132,7 +133,7 @@ export function Act1CurrentState({ filters }: Props) {
       <div>
         <h1 className="text-xl font-bold text-text-primary">Current State</h1>
         <p className="text-text-secondary text-sm mt-0.5">
-          Bottoms-up demand plan — {filters.version_id || "LATEST_EST"} FY{filters.fiscal_year || 2024}
+          Bottoms-up demand plan — {filters.version_id || "Latest Estimate"} FY{filters.fiscal_year || 2024}
         </p>
       </div>
 
@@ -164,10 +165,10 @@ export function Act1CurrentState({ filters }: Props) {
         />
       </div>
 
-      {/* SKU × Retailer heatmap */}
+      {/* SKU × Channel heatmap */}
       <div className="bg-surface border border-border rounded-xl p-5">
-        <h2 className="text-sm font-semibold text-text-primary mb-4">SKU × Retailer Matrix (Top 15 SKUs)</h2>
-        <HeatmapTable rows={top15Skus} cols={accounts} data={heatData} rowLabel="SKU" />
+        <h2 className="text-sm font-semibold text-text-primary mb-4">SKU × Channel Matrix (Top 15 SKUs)</h2>
+        <HeatmapTable rows={top15Skus} cols={channels} data={heatData} rowLabel="SKU" />
       </div>
 
       {/* Top 10 SKUs */}
@@ -191,9 +192,9 @@ export function Act1CurrentState({ filters }: Props) {
               <div key={i} className="flex items-center justify-between py-2 border-b border-border last:border-0">
                 <span className="text-text-primary text-sm font-medium">{e.sku_id}</span>
                 <ExceptionBadge
-                  stockRisk={!!e.stock_risk_flag}
-                  overrideFlag={!!e.override_flag}
-                  isNewSku={!!e.is_new_sku}
+                  accuracyFlag={!!e.accuracy_flag}
+                  biasFlag={!!e.bias_flag}
+                  isNewSku={e.is_new_sku === "True" || e.is_new_sku === true}
                 />
               </div>
             ))}

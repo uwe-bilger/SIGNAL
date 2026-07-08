@@ -9,12 +9,13 @@ interface Props {
 }
 
 function Select({
-  label, value, onChange, options,
+  label, value, onChange, options, emptyLabel = "All",
 }: {
   label: string;
   value: string;
   onChange: (v: string) => void;
   options: { value: string; label: string }[];
+  emptyLabel?: string;
 }) {
   return (
     <div className="flex flex-col gap-1">
@@ -24,7 +25,7 @@ function Select({
         onChange={e => onChange(e.target.value)}
         className="bg-surface border border-border text-text-primary text-sm rounded-lg px-3 py-1.5 min-w-[130px] focus:outline-none focus:border-primary"
       >
-        <option value="">All</option>
+        <option value="">{emptyLabel}</option>
         {options.map(o => (
           <option key={o.value} value={o.value}>{o.label}</option>
         ))}
@@ -57,6 +58,7 @@ export function FilterBar({ dimensions, filters, onChange }: Props) {
         value={filters.version_id || ""}
         onChange={set("version_id")}
         options={versions}
+        emptyLabel="Latest"
       />
       <Select
         label="Division"
@@ -71,7 +73,7 @@ export function FilterBar({ dimensions, filters, onChange }: Props) {
         options={channelTypes}
       />
       <button
-        onClick={() => onChange({ fiscal_year: 2024, version_id: "LATEST_EST" })}
+        onClick={() => onChange({ fiscal_year: 2024 })}
         className="text-text-secondary text-xs border border-border rounded-lg px-3 py-1.5 hover:border-primary hover:text-primary transition-colors self-end"
       >
         Clear
