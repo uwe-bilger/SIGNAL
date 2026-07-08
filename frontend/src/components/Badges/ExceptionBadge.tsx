@@ -1,22 +1,22 @@
 import React from "react";
 
 interface Props {
-  stockRisk?: boolean;
-  overrideFlag?: boolean;
+  biasFlag?: boolean;
+  accuracyFlag?: boolean;
   isNewSku?: boolean;
 }
 
-export function ExceptionBadge({ stockRisk, overrideFlag, isNewSku }: Props) {
+export function ExceptionBadge({ biasFlag, accuracyFlag, isNewSku }: Props) {
   return (
     <span className="inline-flex gap-1">
-      {stockRisk && (
+      {accuracyFlag && (
         <span className="bg-danger/10 text-danger border border-danger/30 text-xs px-1.5 py-0.5 rounded-full">
-          Stock Risk
+          Low Accuracy
         </span>
       )}
-      {overrideFlag && (
+      {biasFlag && (
         <span className="bg-warning/10 text-warning border border-warning/30 text-xs px-1.5 py-0.5 rounded-full">
-          Override
+          Bias
         </span>
       )}
       {isNewSku && (

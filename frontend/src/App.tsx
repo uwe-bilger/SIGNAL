@@ -10,7 +10,8 @@ import { Act2Challenger } from "./pages/Act2Challenger";
 import { Act3Reconciliation } from "./pages/Act3Reconciliation";
 import { Act4Integration } from "./pages/Act4Integration";
 
-const DEFAULT_FILTERS: Filters = { fiscal_year: 2024, version_id: "LATEST_EST" };
+// version_id omitted -> API serves the latest available snapshot per month
+const DEFAULT_FILTERS: Filters = { fiscal_year: 2024 };
 
 function App() {
   const { data: dimensions } = useDimensions();

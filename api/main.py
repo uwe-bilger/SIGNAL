@@ -8,9 +8,9 @@ key_path = Path(__file__).parent.parent / "secrets" / "signal-key.json"
 if key_path.exists():
     os.environ.setdefault("GOOGLE_APPLICATION_CREDENTIALS", str(key_path))
 
-from routers import dimensions, plan, pos, forecast, exceptions, integration, reconciliation
+from routers import dimensions, plan, pos, forecast, exceptions, integration, reconciliation, financial
 
-app = FastAPI(title="SIGNAL API", version="1.0.0")
+app = FastAPI(title="SIGNAL API", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -26,6 +26,7 @@ app.include_router(forecast.router)
 app.include_router(exceptions.router)
 app.include_router(integration.router)
 app.include_router(reconciliation.router)
+app.include_router(financial.router)
 
 
 @app.get("/health")

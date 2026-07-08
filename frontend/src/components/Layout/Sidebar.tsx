@@ -1,5 +1,6 @@
 import React from "react";
 import { NavLink } from "react-router-dom";
+import { APP_VERSION } from "../../version";
 
 const ACTS = [
   { path: "/", label: "Act 1", sublabel: "Current State", icon: "📊" },
@@ -38,6 +39,7 @@ export function Sidebar() {
       </nav>
       <div className="px-5 py-4 border-t border-border">
         <div className="text-text-secondary text-xs">signal.bilger.us</div>
+        <div className="text-text-secondary text-xs opacity-60 mt-0.5">v{APP_VERSION}</div>
       </div>
     </aside>
   );
